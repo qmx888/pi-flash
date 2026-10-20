@@ -168,6 +168,80 @@ fn install_crash_hook() {
     }));
 }
 
+/// 建主窗口（含 Chat 实体、UI 自动化服务接线）。
+///
+/// 首启与 macOS `on_reopen`（关掉唯一窗口后再点 Dock）共用同一条路径——
+/// 关窗后再开窗必须能重建全部状态，否则用户会卡在「进程活着但没有窗口」。
+fn open_main_window(cx: &mut App) {
+    /// 首个窗口的 Chat 句柄（UI 自动化服务用）。
+    static WINDOW_CHAT: std::sync::OnceLock<gpui::WeakEntity<Chat>> = std::sync::OnceLock::new();
+    // 还原尺寸（WINDOW_W/H）与最小尺寸（WINDOW_W/H_MIN）分开：
+    // 宽度同值（还原宽就是最小宽），高度允许再矮 160px。
+    let bounds = gpui::Bounds::centered(None, gpui::size(px(WINDOW_W), px(WINDOW_H)), cx);
+    let window_bounds = gpui::WindowBounds::Windowed(bounds);
+    let window_handle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(window_bounds),
+                // 最小尺寸（逻辑像素，gpui 按 scale_factor 换算后交给
+                // WM_GETMINMAXINFO）：宽同还原宽、高超矮一档
+                window_min_size: Some(gpui::size(px(WINDOW_W_MIN), px(WINDOW_H_MIN))),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some("pi-flash".into()),
+                    // client-side title bar (v54 topbar 两段, window
+                    // control hitboxes registered by titlebar.rs)
+                    appears_transparent: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |window, cx| {
+                // gpui-component widgets require their Root as the window
+                // root view (renders their context-menu/popover layers)
+                let chat = cx.new(Chat::new);
+                let weak = chat.downgrade();
+                // 自动化服务要 Chat 句柄；Root 把它包了一层，从建窗闭包里
+                // 直接存比事后反查类型可靠（Root<Chat> downcast 依赖泛型
+                // 身份，组件升级就断）。只保留首个窗口的句柄。
+                let _ = WINDOW_CHAT.set(weak.clone());
+                // persist window bounds + shell layout on close so the
+                // startup restore layer has data (§4)
+                window.on_window_should_close(cx, move |window, cx| {
+                    let b = window.bounds();
+                    save_window_state(&WindowState {
+                        x: f64::from(b.origin.x),
+                        y: f64::from(b.origin.y),
+                        w: f64::from(b.size.width),
+                        h: f64::from(b.size.height),
+                        maximized: window.is_maximized(),
+                    });
+                    if let Some(chat) = weak.upgrade() {
+                        chat.update(cx, |chat, _cx| chat.persist_ui());
+                    }
+                    true
+                });
+                cx.new(|cx| gpui_component::Root::new(chat.into(), window, cx))
+            },
+        )
+        .unwrap();
+    // UI 自动化服务（pi-flash-2kq）：PI_FLASH_AUTOMATION=<port|auto|1>
+    // 显式开启，缺省关闭——agent 调试用，不抢真实屏幕/鼠标。
+    //
+    // 关窗后再开窗（macOS reopen）不重复起：首启那次已绑好端口，再起必然
+    // `绑定 127.0.0.1:PORT 失败`。reopen 是人工排障路径，不由自动化驱动。
+    static AUTOMATION_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if AUTOMATION_STARTED.get().is_none()
+        && let Ok(spec) = std::env::var("PI_FLASH_AUTOMATION")
+        && let Some(weak) = WINDOW_CHAT.get()
+    {
+        if let Err(e) = automation::start(cx, window_handle.into(), weak.clone(), &spec) {
+            eprintln!("pi-flash automation: {e}");
+        }
+        let _ = AUTOMATION_STARTED.set(());
+    }
+    cx.activate(true);
+}
+
 fn main() {
     let _ = T0.set(std::time::Instant::now());
     install_crash_hook();
@@ -203,9 +277,22 @@ fn main() {
     // language: persisted workspace-memory preference；无偏好默认 zh-CN。
     // set_lang 内同步 gpui-component 的 rust_i18n locale（搜索条文案/tooltip）
     i18n::set_lang(load_lang_pref().unwrap_or(0));
-    Application::new()
-        .with_assets(assets::Assets)
-        .run(|cx: &mut App| {
+    let app = Application::new().with_assets(assets::Assets);
+
+    // macOS 关掉最后一个窗口后进程仍活着（AppKit 默认行为）：Dock 图标再点
+    // 一次走 `applicationShouldHandleReopen:hasVisibleWindows:`，gpui 把它转成
+    // `on_reopen`。不注册这个回调 = 关窗后**永远回不来**（只能强杀进程），所以
+    // 「无窗口」时补开一个。
+    //
+    // Windows/Linux 没有这个语义（关最后一个窗 gpui 直接退出），注册无副作用：
+    // `on_reopen` 只在平台真正发 reopen 时才回调。
+    app.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            open_main_window(cx);
+        }
+    });
+
+    app.run(|cx: &mut App| {
             // JetBrains Mono 随二进制打包：全应用唯一内置 mono（会话区 mono
             // + 终端网格；三档字重 + Italic 覆盖 400/600/700 与斜体）。
             // 注册失败仅回退系统字体，不致命。
@@ -310,64 +397,7 @@ fn main() {
             // 的 pending_zoom 补最大化——0.2.2 建窗即 Maximized 的延迟处理
             // 实测不生效，显式 zoom 是项目已验证路径（从建窗回调后移）。
             let _restored = get_window_state();
-            // 还原尺寸（WINDOW_W/H）与最小尺寸（WINDOW_W/H_MIN）分开：
-            // 宽度同值（还原宽就是最小宽），高度允许再矮 160px。
-            let bounds = gpui::Bounds::centered(None, gpui::size(px(WINDOW_W), px(WINDOW_H)), cx);
-            let window_bounds = gpui::WindowBounds::Windowed(bounds);
-            let automation_chat: std::sync::OnceLock<gpui::WeakEntity<Chat>> =
-                std::sync::OnceLock::new();
-            let window_handle = cx
-                .open_window(
-                    WindowOptions {
-                        window_bounds: Some(window_bounds),
-                        // 最小尺寸（逻辑像素，gpui 按 scale_factor 换算后交给
-                        // WM_GETMINMAXINFO）：宽同还原宽、高超矮一档
-                        window_min_size: Some(gpui::size(px(WINDOW_W_MIN), px(WINDOW_H_MIN))),
-                        titlebar: Some(gpui::TitlebarOptions {
-                            title: Some("pi-flash".into()),
-                            // client-side title bar (v54 topbar 两段, window
-                            // control hitboxes registered by titlebar.rs)
-                            appears_transparent: true,
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    |window, cx| {
-                        // gpui-component widgets require their Root as the window
-                        // root view (renders their context-menu/popover layers)
-                        let chat = cx.new(Chat::new);
-                        let weak = chat.downgrade();
-                        let _ = automation_chat.set(weak.clone());
-                        // persist window bounds + shell layout on close so the
-                        // startup restore layer has data (§4)
-                        window.on_window_should_close(cx, move |window, cx| {
-                            let b = window.bounds();
-                            save_window_state(&WindowState {
-                                x: f64::from(b.origin.x),
-                                y: f64::from(b.origin.y),
-                                w: f64::from(b.size.width),
-                                h: f64::from(b.size.height),
-                                maximized: window.is_maximized(),
-                            });
-                            if let Some(chat) = weak.upgrade() {
-                                chat.update(cx, |chat, _cx| chat.persist_ui());
-                            }
-                            true
-                        });
-                        cx.new(|cx| gpui_component::Root::new(chat.into(), window, cx))
-                    },
-                )
-                .unwrap();
-            // UI 自动化服务（pi-flash-2kq）：PI_FLASH_AUTOMATION=<port|auto|1>
-            // 显式开启，缺省关闭——agent 调试用，不抢真实屏幕/鼠标。
-            if let (Some(weak), Ok(spec)) =
-                (automation_chat.get(), std::env::var("PI_FLASH_AUTOMATION"))
-            {
-                if let Err(e) = automation::start(cx, window_handle.into(), weak.clone(), &spec) {
-                    eprintln!("pi-flash automation: {e}");
-                }
-            }
-            cx.activate(true);
+            open_main_window(cx);
         });
 }
 
