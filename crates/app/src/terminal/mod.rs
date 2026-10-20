@@ -397,6 +397,13 @@ impl gpui::Element for TerminalElement {
                 }
             });
         }
+        // 同帧一致性（crash-1792490920）：prepaint 已把网格 resize 到新行列，
+        // 同帧 paint 的 snapshot 必须用同一份行列数。上面只写 tab.* 的话，
+        // 元素手里的 rows 还是构建帧时的旧值——终端区变矮的那一帧（shell
+        // 退出出横幅/拖窗缩小/字号调大）paint 仍按旧 rows 读网格，越过
+        // screen_lines 直接踩 alacritty 的越界断言。
+        self.cols = cols;
+        self.rows = rows;
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -989,6 +996,36 @@ mod tests {
         assert_eq!(rows[0].styles[0].fg, hsl(TERM_FG));
     }
 
+    /// 裸 `exit` 拦截判定：各种提示符风格下的命中/不命中。
+    #[test]
+    fn exit_swallow_detection() {
+        // cmd 风格：提示符后紧跟命令
+        let cmd = test_term(40, 3, b"d:\\proj>exit");
+        assert!(is_bare_exit(&cmd));
+        // PowerShell 风格 + 命令前后空白
+        let ps = test_term(40, 3, b"PS D:\\proj> exit ");
+        assert!(is_bare_exit(&ps));
+        // bash 风格（$ 提示符）
+        let sh = test_term(40, 3, b"bi@host:/d/x$ exit");
+        assert!(is_bare_exit(&sh));
+        // 大小写不敏感
+        let upper = test_term(40, 3, b"d:\\proj>EXIT");
+        assert!(is_bare_exit(&upper));
+        // 无提示符风格的裸行
+        let bare = test_term(40, 3, b"exit");
+        assert!(is_bare_exit(&bare));
+        // 带参数/别的命令/空行：不拦
+        let with_arg = test_term(40, 3, b"d:\\proj>exit 0");
+        assert!(!is_bare_exit(&with_arg));
+        let other = test_term(40, 3, b"d:\\proj>dir");
+        assert!(!is_bare_exit(&other));
+        let empty = test_term(40, 3, b"d:\\proj>");
+        assert!(!is_bare_exit(&empty));
+        // python REPL：exit() 是合法调用，不吞
+        let py = test_term(40, 3, b">>> exit()");
+        assert!(!is_bare_exit(&py));
+    }
+
     #[test]
     fn snapshot_sgr_colors_and_inverse() {
         // red text, then inverse space
@@ -1564,6 +1601,26 @@ impl Chat {
         let Some(tab) = self.ws.terminals.get(tix) else {
             return;
         };
+        // 裸 `exit` 拦截：内嵌终端里 shell 退出只会留下一块「Process
+        // exited」死面，没有再进去的路。Enter 时看一眼光标行，命令就是
+        // `exit` 就当作用户要关这个终端——直接关掉 tab（同点 tab 的 ×，
+        // PTY Shutdown 一并走）。`exit 0` 等带参数的不算，照常执行（出
+        // 横幅不崩）；全屏应用不掺和。
+        if k.key == "enter" && !mode.contains(TermMode::ALT_SCREEN) {
+            let bare_exit = is_bare_exit(&tab.term.lock());
+            let tab_id = tab.id;
+            if bare_exit
+                && let Some(ix) = self
+                    .ws
+                    .panel_tabs
+                    .iter()
+                    .position(|t| matches!(t, crate::PanelTab::Term(id) if *id == tab_id))
+            {
+                self.close_tab_at(ix, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
         if let Some(bytes) = terminal::keystroke_to_pty(k, &mode) {
             let _ = tab.pty.send(Msg::Input(bytes.into()));
             cx.stop_propagation();

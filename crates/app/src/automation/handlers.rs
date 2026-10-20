@@ -395,12 +395,14 @@ pub(super) fn dispatch(
                 .get("view")
                 .and_then(Value::as_str)
                 .ok_or_else(|| bad("需要 {\"view\": \"chat|term|file\"}"))?;
-            chat.set_content_view(match view {
-                "chat" => ContentView::Chat,
-                "term" => ContentView::Term,
-                "file" => ContentView::File,
+            match view {
+                "chat" => chat.set_content_view(ContentView::Chat),
+                "term" => chat.set_content_view(ContentView::Term),
+                "file" => chat.set_content_view(ContentView::File),
+                // 040-1：市场页走真开页路径（建搜索框 + ensure_loaded 拉首页）
+                "pi-ext-market" => chat.open_pi_ext_market(cx),
                 other => return Err(bad(format!("未知内容视图: {other:?}"))),
-            });
+            }
             cx.notify();
             ok()
         }

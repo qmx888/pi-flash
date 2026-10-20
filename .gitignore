@@ -1,6 +1,7 @@
 # Rust
 **/target/
 target-auto/
+target-check/
 
 # zcode session artifacts
 .zcode/

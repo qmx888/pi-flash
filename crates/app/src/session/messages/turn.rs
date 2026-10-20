@@ -1057,45 +1057,9 @@ pub(crate) fn render_assistant_turn(
             t,
         ));
     }
-    // c24: 轮内写文件 chips（pi-web TurnWrittenFiles parity：由
-    // 成功的 write/edit/apply_patch 工具调用推导，绝不扫描回复文本）
+    // c24: 轮内写文件 chips（pi-web TurnWrittenFiles parity，见 written_files_chips）
     let written = turn_written_files(turn);
-    if !written.is_empty() {
-        let mut chips = div().flex().flex_wrap().gap(px(6.)).mt(px(6.));
-        for path in &written {
-            let p = path.clone();
-            let weak_open = weak.clone();
-            let name = std::path::Path::new(path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.clone());
-            chips = chips.child(
-                div()
-                    .id(SharedString::from(format!("wf-{start_ix}-{name}")))
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .px(px(8.))
-                    .py(px(2.))
-                    .rounded(px(6.))
-                    .bg(rgba(t.bg_subtle))
-                    .border_1()
-                    .border_color(rgb(t.border))
-                    .font_family(crate::editor::markdown::MONO_FAMILY)
-                    .text_size(crate::appearance::sess_size(-2.))
-                    .text_color(rgb(t.text))
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(rgb(t.text)))
-                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        let p = p.clone();
-                        let _ = weak_open.update(cx, |c, cx| {
-                            c.open_file_tab(std::path::PathBuf::from(&p), cx)
-                        });
-                    })
-                    .child(icon("file", 12., t.text_dim))
-                    .child(SharedString::from(name)),
-            );
-        }
+    if let Some(chips) = written_files_chips(start_ix, weak, &written, t) {
         col = col.child(chips);
     }
     col = col.child(actions_bar::assistant_action_bar(
@@ -1111,6 +1075,55 @@ pub(crate) fn render_assistant_turn(
         t,
     ));
     col.into_any_element()
+}
+
+/// c24: 轮内写文件 chips（pi-web TurnWrittenFiles parity：由
+/// 成功的 write/edit/apply_patch 工具调用推导，绝不扫描回复文本）。
+fn written_files_chips(
+    start_ix: usize,
+    weak: &gpui::WeakEntity<Chat>,
+    written: &[String],
+    t: &theme::Theme,
+) -> Option<gpui::AnyElement> {
+    if written.is_empty() {
+        return None;
+    }
+    let mut chips = div().flex().flex_wrap().gap(px(6.)).mt(px(6.));
+    for path in written {
+        let p = path.clone();
+        let weak_open = weak.clone();
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+        chips = chips.child(
+            div()
+                .id(SharedString::from(format!("wf-{start_ix}-{name}")))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .px(px(8.))
+                .py(px(2.))
+                .rounded(px(6.))
+                .bg(rgba(t.bg_subtle))
+                .border_1()
+                .border_color(rgb(t.border))
+                .font_family(crate::editor::markdown::MONO_FAMILY)
+                .text_size(crate::appearance::sess_size(-2.))
+                .text_color(rgb(t.text))
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(t.text)))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    let p = p.clone();
+                    let _ = weak_open.update(cx, |c, cx| {
+                        c.open_file_tab(std::path::PathBuf::from(&p), cx)
+                    });
+                })
+                .child(icon("file", 12., t.text_dim))
+                .child(SharedString::from(name)),
+        );
+    }
+    Some(chips.into_any_element())
 }
 
 #[cfg(test)]

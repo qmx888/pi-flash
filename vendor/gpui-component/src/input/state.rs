@@ -632,6 +632,7 @@ impl InputState {
         &mut self,
         selected_range: &Range<usize>,
         new_text: &str,
+        old_text: Option<&Rope>,
         force: bool,
         cx: &mut Context<Self>,
     ) {
@@ -639,7 +640,7 @@ impl InputState {
             return;
         }
         self.mode
-            .update_highlighter(selected_range, &self.text, new_text, force, cx);
+            .update_highlighter(selected_range, &self.text, old_text, new_text, force, cx);
     }
 
     /// 大代码文件的全文 parse 转后台。返回 true 表示已接管（调用方跳过同
@@ -2487,7 +2488,7 @@ impl EntityInputHandler for InputState {
         }
         self.text_wrapper
             .update(&self.text, &range, &Rope::from(new_text), cx);
-        self.update_highlighter(&range, new_text, true, cx);
+        self.update_highlighter(&range, new_text, Some(&old_text), true, cx);
         self.lsp.update(&self.text, window, cx);
         self.selected_range = (new_offset..new_offset).into();
         self.ime_marked_range.take();
@@ -2540,7 +2541,7 @@ impl EntityInputHandler for InputState {
         }
         self.text_wrapper
             .update(&self.text, &range, &Rope::from(new_text), cx);
-        self.update_highlighter(&range, new_text, true, cx);
+        self.update_highlighter(&range, new_text, Some(&old_text), true, cx);
         self.lsp.update(&self.text, window, cx);
         if new_text.is_empty() {
             // Cancel selection, when cancel IME input.
@@ -2548,10 +2549,23 @@ impl EntityInputHandler for InputState {
             self.ime_marked_range = None;
         } else {
             self.ime_marked_range = Some((range.start..range.start + new_text.len()).into());
+            // PF 修复（2026-10-20）：new_selected_range_utf16 是【新文本内】
+            // 的选区（组合串 caret，utf16），转绝对偏移的基准是 range.start；
+            // 原式尾端错加 range.end（旧替换区间末尾）——组合串替换已标记
+            // 文本（M>0，中文 IME 每次打拼音都发生）时选区末端被多加 M 字节，
+            // 越过插入文本、落进后续多字节汉字中间；该脏区间随后经兜底路径
+            // 直通 tree-sitter InputEdit → 解析回调 mid-char 切片 → 不可
+            // unwind 的 panic → 进程 abort。
             self.selected_range = new_selected_range_utf16
                 .as_ref()
                 .map(|range_utf16| self.range_from_utf16(range_utf16))
-                .map(|new_range| new_range.start + range.start..new_range.end + range.end)
+                .map(|new_range| {
+                    let start = new_range.start + range.start;
+                    let end = (new_range.end + range.start)
+                        .min(self.text.len())
+                        .max(start);
+                    start..end
+                })
                 .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len())
                 .into();
         }
@@ -2644,7 +2658,7 @@ impl Focusable for InputState {
 impl Render for InputState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self._pending_update {
-            self.update_highlighter(&(0..0), "", false, cx);
+            self.update_highlighter(&(0..0), "", None, false, cx);
             self.lsp.update(&self.text, window, cx);
             self._pending_update = false;
         }

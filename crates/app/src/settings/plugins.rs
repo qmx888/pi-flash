@@ -411,23 +411,6 @@ fn pl_detail(
     };
     let src = pi_link::skills::entry_source(v);
     let disabled = pi_link::skills::entry_disabled(v);
-    // 082：检测失败原因（Error 态的 message，如 not installed / 网络错误）
-    let update_note = match chat.aux.plugin_updates.state_of(&src) {
-        Some(crate::services::plugin_updates::PkgUpdateState::Error) => chat
-            .aux
-            .plugin_updates
-            .results
-            .iter()
-            .find(|r| r.source == src)
-            .and_then(|r| r.message.clone())
-            .map(|m| {
-                div()
-                    .text_size(crate::appearance::ui_size(11.))
-                    .text_color(rgb(t.text_dim))
-                    .child(SharedString::from(m))
-            }),
-        _ => None,
-    };
     let description = pi_link::skills::package_description(&src);
     let weak_trash = weak.clone();
     let trash_src = src.clone();
@@ -513,16 +496,11 @@ fn pl_detail(
         ))
         .child(field(
             &tr("plugins.state"),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .child(if disabled {
-                    SharedString::from(tr("status.disabled").to_string())
-                } else {
-                    SharedString::from(tr("status.enabled").to_string())
-                })
-                .children(update_note),
+            div().flex().flex_col().gap(px(2.)).child(if disabled {
+                SharedString::from(tr("status.disabled").to_string())
+            } else {
+                SharedString::from(tr("status.enabled").to_string())
+            }),
         ))
         .child(field(
             &tr("tokens.prompt_size"),

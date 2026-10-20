@@ -126,6 +126,19 @@ impl SessionRuntime {
 
     fn last_assistant(&mut self) -> &mut Msg {
         if !matches!(self.messages.last(), Some(m) if m.role == Role::Assistant) {
+            // 流已切断（abort 在途）：管道残包属于**旧轮**，最后一条消息往往
+            // 已是乐观追加的打断气泡——照常兜底推壳会让旧内容长在气泡后面，
+            // 气泡视觉上跳到 agent 输出上方。并入最后一条既有 assistant
+            // （TextEnd/ThinkingEnd 携带全文，正好把被截断的旧回复补完整）；
+            // 一个 assistant 都没有（理论边缘）才退回推壳。
+            if self.stream_cut
+                && let Some(ix) = self
+                    .messages
+                    .iter()
+                    .rposition(|m| m.role == Role::Assistant)
+            {
+                return &mut self.messages[ix];
+            }
             self.messages.push(Msg {
                 role: Role::Assistant,
                 bash: None,

@@ -20,7 +20,7 @@ CommandLineTools 时 `xcrun metal` 不可用，`just` 各 recipe 已带上）。
 不开 just 时的等价命令：`cargo run -p app --features gpui/macos-blade`、
 `RUST_MIN_STACK=33554432 cargo test -p pi-link`（协议/路径测试都在 pi-link）。
 
-- 环境变量：`PI_FLASH_PI_BIN` 覆盖内置 pi；`PI_FLASH_THEME` 切主题（default/dark/rose）；`PI_FLASH_RPC_LOG` 开 RPC 线缆日志；**`PI_FLASH_DIR` 显式指定永远优先；未设时按构建档位取默认——debug/test（cargo run/cargo test）自动落 `./pi-flash-dev`，release 才落 `~/.pi-flash`**（2026-10-18 起 paths 层焊死，裸跑测试摸不到正式目录；dev home 已进 `.gitignore`）；**dev-flags（重型模块发版排除，2026-10-19 起）默认全关**：`<PF数据目录>/dev-flags.json`（支持 // 注释）按键控模块，false/缺省=关、改动重启生效；键住址 = pi-link `dev_flags::KNOWN`（现仅 `subagents`），env 覆盖 `PI_FLASH_<键大写>=1/0` 最高优先，启动 stderr 打 `[startup] dev-flags:` 状态行。子代理关 = 不加载扩展 + 隐藏设置页与面板按钮
+- 环境变量：`PI_FLASH_PI_BIN` 覆盖内置 pi；`PI_FLASH_THEME` 切主题（default/dark/rose）；`PI_FLASH_RPC_LOG` 开 RPC 线缆日志；**`PI_FLASH_DIR` 显式指定永远优先；未设时按构建档位取默认——debug/test（cargo run/cargo test）自动落 `./pi-flash-dev`，release 才落 `~/.pi-flash`**（2026-10-18 起 paths 层焊死，裸跑测试摸不到正式目录；dev home 已进 `.gitignore`）；**dev-flags（重型模块发版排除，2026-10-19 起）默认全关**：`<PF数据目录>/dev-flags.json`（支持 // 注释）按键控模块，false/缺省=关、改动重启生效；键住址 = pi-link `dev_flags::KNOWN`（现仅 `subagents`），env 覆盖 `PI_FLASH_<键大写>=1/0` 最高优先，启动 stderr 打 `[startup] dev-flags:` 状态行（仅 debug 构建——release 包零输出是烟测门禁）。子代理关 = 不加载扩展 + 隐藏设置页与面板按钮
 - UI 验证一律走 pif-ui 自动化链路，禁止抢真实屏幕
 
 # 铁律
@@ -126,9 +126,14 @@ crates/app/src/         GPUI 界面（Chat = 全应用状态实体：直属字�
                           chat_list 滚屏、menu 补全菜单 + attachments 附件、
                           fork、diff、model/plugin/mcp picker、new_session（012）、
                           tools_recipe 档位配方（034）
-  settings/               设置面板六页（界面/模型/技能/扩展/MCP/其他）+ widgets 公共件
+  settings/               设置面板六页（界面/模型/技能/扩展/MCP/其他）；widgets 只剩
+                          select_section，公共件全部转发 ui/kit（存量调用点零改动）
   ui/                     通用件：tokens（UI组件规范唯一代码落点）、button、text_input、
                           composer_input、dropdown、overlay、popup、vlist、psp_scrollbar
+  ui/kit/                 页面级组件库（**新页面只从这里取控件，禁就地手搓**）：
+                          button（Btn+config_button）/ switch（三态开关）/ row（set_row、
+                          field、文本块）/ layout（两栅骨架、LIST_W）/ badge（黊标·
+                          状态点）/ slider（width_slider）；尺寸见 UI组件规范 §10
 ```
 
 # 领域笔记（docs/agents/）
@@ -138,6 +143,7 @@ crates/app/src/         GPUI 界面（Chat = 全应用状态实体：直属字�
 - [pi-rpc.md](docs/agents/pi-rpc.md)：pi RPC wire 陷阱 + vendor 升级复核点。覆盖 `crates/pi-link/**` 与 app 侧消费方（agent_session、session/runtime、messages、ext_ui）。
 - [gpui.md](docs/agents/gpui.md)：gpui 0.2.2（vendored）/ gpui-component 渲染与交互陷阱。覆盖 `crates/app/src/**`。
 - [engineering.md](docs/agents/engineering.md)：Rust/工具链工程杂项（补丁方式、CRLF、Windows 路径、测试栈、真实按键链）。
+- [market.md](docs/agents/market.md)：040-1 Pi 扩展市场（入口开关、页状态机、磁盘快照、布局踩点、与设计稿/规范的三方漂移）。覆盖 `crates/app/src/market/**` + `crates/pi-link/src/market/**`。
 
 
 

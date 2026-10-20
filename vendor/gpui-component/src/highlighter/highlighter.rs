@@ -392,8 +392,26 @@ impl SyntaxHighlighter {
                 if offset >= text.len() {
                     ""
                 } else {
-                    let (chunk, chunk_byte_ix) = text.chunk(offset);
-                    &chunk[offset - chunk_byte_ix..]
+                    // PF 修复（2026-10-20，见 docs/agents/gpui.md）：增量树与
+                    // 文本不自洽时 tree-sitter 可能索要落在多字节字符中间的
+                    // offset，此处裸切片直接 panic——而本回调跑在 tree-sitter
+                    // 的 C++ 帧内（extern "C" 边界），panic 不可 unwind →
+                    // 进程 abort（0xc0000409，编辑中文 md 时进程瞬间消失）。
+                    // 非边界时回退到前一个字符边界：宁可给上游一段错位字节
+                    // 产生可恢复的解析错误，也不让它带走整个应用。
+                    let mut byte_ix = offset;
+                    while byte_ix > 0 && !text.is_char_boundary(byte_ix) {
+                        byte_ix -= 1;
+                    }
+                    let (chunk, chunk_byte_ix) = text.chunk(byte_ix);
+                    let mut rel = byte_ix.saturating_sub(chunk_byte_ix);
+                    if rel > chunk.len() {
+                        rel = chunk.len();
+                    }
+                    while rel > 0 && !chunk.is_char_boundary(rel) {
+                        rel -= 1;
+                    }
+                    &chunk[rel..]
                 }
             },
             Some(&old_tree),

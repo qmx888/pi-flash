@@ -10,12 +10,12 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gpui::{div, prelude::*, px, rgb, AnyElement, MouseButton, SharedString};
+use gpui::{AnyElement, MouseButton, SharedString, div, prelude::*, px, rgb};
 
 use crate::appearance::theme::Theme;
 use crate::i18n::tr;
-use crate::ui::icon;
 use crate::ui::WithTip;
+use crate::ui::icon;
 use crate::{Chat, QueueDragState};
 
 /// 拖拽载荷（drop 监听按 TypeId 匹配，与 psp 的 ProjDragTab 互不串扰）。
@@ -37,9 +37,7 @@ fn sync_drag(chat: &mut Chat, inside: bool, cx: &mut gpui::Context<Chat>) {
         if let Some(d) = &mut chat.composer.queue_drag {
             d.at = Instant::now();
         } else {
-            chat.composer.queue_drag = Some(QueueDragState {
-                at: Instant::now(),
-            });
+            chat.composer.queue_drag = Some(QueueDragState { at: Instant::now() });
             chat.composer.queue_drop_ix = None;
             spawn_watchdog(cx);
         }
@@ -236,7 +234,9 @@ pub(crate) fn queue_cards_strip(
                         .child(icon("menu", 12., t.text_faint)),
                 )
                 // 微信远程来的条目：来源标识（与 composer 条目区分）
-                .when(entry.remote, |d| d.child(icon("smartphone", 12., t.text_muted)))
+                .when(entry.remote, |d| {
+                    d.child(icon("smartphone", 12., t.text_muted))
+                })
                 .child(
                     div()
                         .flex_1()

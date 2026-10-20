@@ -124,6 +124,10 @@ pub fn snapshot(
     selection: Option<(SelPt, SelPt)>,
 ) -> Vec<SnapRow> {
     let grid = term.grid();
+    // 行数钳制（crash-1792490920）：调用方（paint）的行数戳若与网格脱节
+    // （同帧 resize 后的旧值/weak.update 失败），越过 screen_lines 会直
+    // 接踩 storage 的越界断言；这里按网格真实行数收口，多出的行不画。
+    let rows = rows.min(grid.screen_lines());
     let offset = grid.display_offset() as i32;
     let cols = grid.columns();
 
@@ -192,6 +196,32 @@ pub fn snapshot(
         out.push(SnapRow { text, styles });
     }
     out
+}
+
+/// 裸 `exit` 判定：光标所在输入行剥掉提示符（cmd/PS 的 `>`、bash/fish
+/// 的 `$`、zsh 的 `%`、root 的 `#`）后正好是 `exit`（大小写不敏感、允许
+/// 首尾空白）→ true。alt screen 由调用方先行排除。`exit 0` / `exit()`
+/// 这类带尾巴的不算裸 exit。命中时由调用方决定动作（当前 = 关终端 tab）。
+pub fn is_bare_exit(term: &Term<Proxy>) -> bool {
+    let content = term.renderable_content();
+    let line = content.cursor.point.line.0;
+    let grid = term.grid();
+    let row = &grid[Line(line)];
+    let cols = grid.columns();
+    let mut text = String::with_capacity(cols);
+    for c in 0..cols {
+        let cell = &row[Column(c)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        text.push(if cell.c == '\0' { ' ' } else { cell.c });
+    }
+    let trimmed = text.trim_end();
+    let after_prompt = match trimmed.rfind(['>', '$', '%', '#']) {
+        Some(ix) => &trimmed[ix + 1..],
+        None => trimmed,
+    };
+    after_prompt.trim().eq_ignore_ascii_case("exit")
 }
 
 /// Extract the selected text from the grid (xterm `getString` parity: trailing

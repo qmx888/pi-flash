@@ -215,8 +215,45 @@ impl Chat {
         cx.notify();
     }
 
+    /// 思考档换挡入口（胶囊菜单 / 微信菜单同源）。`key` 是 pi 的档位键，
+    /// 特例 `"auto"` = 「使用 pi 默认设置」：pi 没有 auto 档，得把设置里
+    /// 解出来的默认档显式下发（只清本地 override 等于点了没反应）。
     pub(crate) fn set_thinking_level(&mut self, key: &str, cx: &mut Context<Self>) {
+        if key == "auto" {
+            let def = self.pi_default_thinking(cx);
+            self.rt().update(cx, |r, cx| r.set_thinking_auto(&def, cx));
+            return;
+        }
         self.rt().update(cx, |r, cx| r.set_thinking_level(key, cx));
+    }
+
+    /// pi 侧对当前模型生效的默认思考档：enabledModels pin > 设置页记录的
+    /// per-model 档 > 全局 defaultThinkingLevel > pi 内置缺省（medium）。
+    /// 与 012 新会话默认档同一把尺子（{@link new_session_default}），只是
+    /// 锚在当前模型而不是默认模型上。
+    fn pi_default_thinking(&self, cx: &gpui::App) -> String {
+        let rt = self.rt().read(cx);
+        let model_key = rt
+            .state
+            .as_ref()
+            .and_then(|s| s.model.as_ref())
+            .map(|m| format!("{}/{}", m.provider, m.id))
+            .or_else(|| rt.pending_model.as_ref().map(|(p, id)| format!("{p}/{id}")))
+            .or_else(|| {
+                self.cfg
+                    .mc_default_model
+                    .as_ref()
+                    .map(|(p, id)| format!("{p}/{id}"))
+            });
+        let lookup = |list: &[(String, String)]| {
+            model_key
+                .as_ref()
+                .and_then(|k| list.iter().find(|(p, _)| p == k).map(|(_, l)| l.clone()))
+        };
+        lookup(&self.cfg.mc_state.pins)
+            .or_else(|| lookup(&self.cfg.mc_model_thinking))
+            .or_else(|| self.cfg.mc_default_thinking.clone())
+            .unwrap_or_else(|| pi_link::config::PI_DEFAULT_THINKING_LEVEL.to_string())
     }
 
     /// `/` 菜单命令清单（010-启动.md §3）：会话进程答过 → 用它（含项目 skill）；

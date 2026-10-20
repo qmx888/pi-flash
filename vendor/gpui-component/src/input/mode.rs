@@ -168,6 +168,7 @@ impl InputMode {
         &mut self,
         selected_range: &Range<usize>,
         text: &Rope,
+        old_text: Option<&Rope>,
         new_text: &str,
         force: bool,
         cx: &mut App,
@@ -211,9 +212,17 @@ impl InputMode {
                 let changed_len = new_text.len() as isize - selected_range.len() as isize;
                 let new_end = (selected_range.end as isize + changed_len) as usize;
 
-                let start_pos = text.offset_to_point(selected_range.start);
-                let old_end_pos = text.offset_to_point(selected_range.end);
-                let new_end_pos = text.offset_to_point(new_end);
+                // PF 修复（2026-10-20）：tree-sitter InputEdit 的
+                // start_position / old_end_position 必须是【编辑前】文本的
+                // 坐标；原实现已在文本被改写后拿新文本现算，区间内行数一变
+                // （多行/含换行替换）位置全错，树状态与文本失配——增量树
+                // 漂移的脏状态来源之一。旧坐标由调用方传变异前快照；无快照
+                // （渲染帧全量路径，edit 为零值）时退回新文本，该路径不碰
+                // 字节轴。
+                let old = old_text.unwrap_or(text);
+                let start_pos = old.offset_to_point(selected_range.start.min(old.len()));
+                let old_end_pos = old.offset_to_point(selected_range.end.min(old.len()));
+                let new_end_pos = text.offset_to_point(new_end.min(text.len()));
 
                 let edit = InputEdit {
                     start_byte: selected_range.start,

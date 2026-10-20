@@ -496,6 +496,12 @@ pub fn read_default_model(path: &Path) -> Option<(String, String)> {
     Some((provider, model))
 }
 
+/// pi 侧全局思考档缺省值（pi `core/defaults.ts` 的
+/// `DEFAULT_THINKING_LEVEL`）。settings.json 没写 defaultThinkingLevel、
+/// 当前模型也没有 per-model 记录时，pi 就用它——「思考强度 → 使用 pi 默认
+/// 设置」要下发的就是这一档。
+pub const PI_DEFAULT_THINKING_LEVEL: &str = "medium";
+
 /// `settings.defaultThinkingLevel` — global fallback thinking level for new
 /// sessions (pi SettingsManager.getDefaultThinkingLevel).
 pub fn read_default_thinking_level(path: &Path) -> Option<String> {

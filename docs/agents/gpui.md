@@ -60,6 +60,7 @@
 ## 布局
 
 - gpui div 默认 **block**（Style::default 显式 Display::Block，taffy block 流）：子级 `flex_1` 失效、**absolute 定位子元素不撑高父级**——包一层「flex_1 子元素 + absolute 列表」的容器若忘了显式 `.flex().flex_col()`，内层高度塌 0、整块内容不可见（数据/状态都正常，纯渲染消失；文件树滚动条改造 c565c61 翻过车，标题行横排 1fc0fe3 同源）。排查口：`pif-ui snapshot` 数据完好但 `shot` 空白，先查新包的 wrapper 有没有显式 flex。
+- **自定义 Element 的 prepaint/paint 是同一实例同帧接力**：prepaint 里测出新的布局尺寸后若只写回数据源（`weak.update` 摸 tab/chat），元素自己的字段副本不同步，同帧 paint 用的还是构建时的旧值。终端区变矮的那一帧（shell 退出出横幅/拖窗缩小/字号调大）paint 按旧 rows 读已 resize 的网格 → alacritty `storage.rs` 越界断言崩（crash-1792490920）。规矩：**prepaint 算出的新值必须同帧写回 self.**，paint 只读元素副本；外部数据源作为下一帧的输入。
 
 ## overlay 与 hitbox
 
@@ -162,6 +163,14 @@
   字面量（release 里 panic 才格式化、dump 未必有，但**入栈的静态字符串指针**
   能在 `.rdata` 里认出来）常能直接认出是 `unwrap`/`expect`/索引类。
 - 双重租约：事件派发期间同步 update/drop 正被派发的实体 → `cx.defer`；自动化 keys 同理（INPUT_KEYS 走 window.defer）。
+- **实体自己的回调里回头读它自己 = 双租 panic = 进程直接消失。**
+  `TextInput::set_on_submit/on_change` 的回调是在 TextInput 自己的 `update`
+  里发起的，回调里再 `input.read(cx)`（哪怕绕经 `Chat` 的方法）立刻撞
+  `cannot read … while it is already being updated`（`app/entity_map.rs:184`
+  `double_lease_panic`）。**回调已经给了值就用回调参数**（`on_submit(&str)` /
+  `on_change(&str)`），别回头摸实体。实例：插件市场搜索框回车即崩（040-1，
+  2026-10-20），`pi_ext_search_now()` 读输入框 → 改成 `pi_ext_search_with(v)`，
+  按钮路径才允许 `read`（按钮事件不在输入框的 update 里）。
 - `window.update`/`chat.update` 不 flatten（catch_unwind 四层嵌套）；vendored `WeakEntity::update` 签名与 Zed 上游不同，别照抄；渲染期读取的实体会注册 window invalidator（InputState notify 即重渲染）。
 - **vendored gpui 0.2.2 的 `Entity` 子元素每帧无条件重渲染**（view.rs `impl Element for Entity` 直接 `view.render()`，没有脏检查复用）；唯一复用路径是 `AnyView::cached(style)`（未 notify 即回收上一帧 layout+paint，`window.refresh()` 会击穿）。后果：composer 每键 `Chat` notify = **全窗口重建**（消息区 markdown 元素 + dock + chrome 全连坐）。消息列表是 `list()` 闭包不是实体，吃不到 cached——要隔离只有把轮次包实体 + cached（大手术）。在此前提下，Chat::render 每帧路径严禁 O(会话规模) 的分配：命令表/模型目录/全文拷贝都要门控或借用化（composer 打字卡顿 2026-10-12 排查的落点：slash_commands 深克隆、new_session_default 全目录扫描、set_value 镜像克隆）。
 
@@ -205,3 +214,9 @@
 - **vendor 本地改动（升级必须重套）**：`input/state.rs` `scroll_to`（**点击可见行瞬移屏幕底部修复**，2026-10-16）：滚轮路径 `update_scroll_offset` 钳的是含垫底的 `scroll_size`（半视口 overscroll），末行可合法停进视口中部；而 scroll_to 尾部曾**无条件**把 offset 重钳进纯内容范围并写 `deferred_scroll_offset`——点击视口中部的末行，停好的滚动位被拽回内容底、该行瞬移屏幕底部（10-15 那条「两钳制并存不冲突」的判断不成立，冲突在光标可见也落账）。修法：内容钳制收进上下两支越界分支（只作用于「解」），函数尾仅在 `scroll_offset != scroll_handle.offset()` 时写 deferred + notify——光标可见时滚动位不动，用户 overscroll 停车保留；分支解行为与 10-15 振荡修复一致（不越内容底、不裁顶）。
 - **vendor 本地改动（升级必须重套）**：`platform/windows/events.rs` `handle_cursor_changed`（**拖拽期光标不切样式修复**，2026-10-16）：原实现只在 `current_cursor` 的 **Some/None 翻转**时 `SetCursor`，「有→有」的样式切换全押给系统 `WM_SETCURSOR`；而**拖拽（按住键）期间系统不再派发 WM_SETCURSOR** → 光标整段钉在起手样式，松手那一刻才被补上（项目行 OpenHand → `App::set_active_drag_cursor_style(ClosedHand)` 的握紧手错位一整段：悬停与拖动同显小手、放下才显抓住）。修法 = 句柄**变了**（含 None 翻转与句柄不同）即 `SetCursor`。诊断记忆点：**同一处光标在不同修饰状态（拖拽/按住键）下表现不一致 → 先怀疑 SetCursor 的触发时机，不要一路往渲染/命中查找**。
 - **vendor 本地改动（升级必须重套）**：`platform/windows/cursor.rs`（新模块）+ `platform/windows/util.rs` `load_cursor`（**OpenHand/ClosedHand 自绘 grab 光标**，2026-10-16）：Windows 系统光标集只有指向手 IDC_HAND，OpenHand/ClosedHand 原本落 `_` 箭头兜底；新实现 = 内嵌手掌 SVG（用户供图：iconfont 实心路径 1024 视框，渲染 `fill="#fff" stroke="#000"` 白身黑线，Windows 箭头同款配方）→ `SvgRenderer::render_pixmap` 32×32 → `CreateDIBSection`（32bpp BGRA 直通 alpha、负高自上而下）+ 全零 AND 掩码 → `CreateIconIndirect`（HICON/HCURSOR 句柄互通，热点按位图实测 (17,0)/(16,2)），进程级缓存、失败回退箭头。**改图一轮的教训**：初版拿 lucide 描边图做「双层描边 + 洪泛填实心」，被用户否——描边画法修不出系统光标观感，且 lucide 路径不可直接填充；换天生实心的路径后仍波两次：纯白填充在浅色面板上边线发灰看不清 → 定稿白填充 + 黑描边（黑线保浅底、白身保深底，两主题都可辨）。**自绘光标图形要选「天生实心」的源；配色跟系统箭头走「白身 + 黑边」，单色在另一主题必踩坑**。配套陷阱：**div paint 光标注册逆序折叠后者胜**（`Frame::cursor_style` rev fold，窗口级 `set_window_cursor_style` 直接短路获胜）——注册晚的 overlay（如自绘滚动条对全面板 hitbox 注册 Arrow）会钉死整片光标；**拖拽幽灵以 `AvailableSpace::min_size()` 双轴约束布局**（window.rs draw_roots，不显式定宽即塌缩成内容宽）；拖拽期光标 = `AnyDrag.cursor_style`（源元素 base mouse_cursor 起值，可 `App::set_active_drag_cursor_style` 覆写，窗口级生效）。
+- **vendor 本地改动（升级必须重套）**：`highlighter/highlighter.rs` parse 读取回调 + `input/state.rs` IME 组合选区 + `input/mode.rs` InputEdit 旧坐标（**中文 md 编辑进程瞬间消失**，2026-10-20，用户实机三连崩 `crash-*.log` 全同栈）：
+  - **炸点**：`update()` 里 `&chunk[offset - chunk_byte_ix..]` 裸切片。tree-sitter 在增量树与文本不自洽时会索要**落在多字节字符中间**的 offset（中文一字 3 字节），切片直接 panic；而该闭包被 tree-sitter 经 `extern "C"` 调回，panic **不可 unwind** → `panic_cannot_unwind` → abort（0xc0000409，无报错框、窗口直接消失）。crash log 记到的是 abort 那条（`library/core/src/panicking.rs:225 panic in a function that cannot unwind`），**原始 panic 消息会因 crash 日志按秒命名被同秒覆盖**——排查这类事故先改日志命名再谈复现。栈特征：`tree_sitter_json` / `_CxxFrameHandler3` / `RaiseException` / `CallWindowProcW`（符号解析只剩 C 静态库名，别被带偏去查 JSON 语法）。
+  - **脏 offset 主源（根因）**：`replace_and_mark_text_in_range` 的 `new_selected_range_utf16` 是**新文本内**的选区（组合串 caret），转绝对偏移基准应为 `range.start`；原式尾端错加 `range.end`（旧替换区间末尾）→ 中文 IME 每次组合更新（替换已标记文本 M>0）选区末端多加 M 字节，越过插入文本落进后续汉字中间；脏区间随后经替换兜底路径直通 `InputEdit`。已改 `+ range.start` 并钳 `[start, text.len()]`。
+  - **次源**：`mode.rs::update_highlighter` 三处 Point 全在**新文本**上算（`old_end_position` 语义丢失，多行/含换行替换时行号错）。已改为调用方传变异前快照（`update_highlighter(.., old_text: Option<&Rope>, ..)`，渲染帧零值路径传 None 退回新文本）。
+  - **保命层**：回调里 offset 非字符边界时回退到前一字符边界（宁可给上游一段错位字节产生可恢复解析错误，不让它带走进程）。**通用规则：任何要交给 C/C++（tree-sitter、DirectWrite、平台回调）的闭包里，对用户文本的切片都必须过 `is_char_boundary` 守卫**——这类 panic 不是普通崩溃，是进程级 abort，catch_unwind 也兜不住。
+  - 复现配方（本次定性用，探针已删）：`SyntaxHighlighter::new("markdown")` + 文章 rope 全量 parse 打底，再按 vendor 口径喂 `InputEdit` 做多行选区替换 / mid-char 脏区间，即可在 `highlighter.rs` 同点位复现同款 abort。

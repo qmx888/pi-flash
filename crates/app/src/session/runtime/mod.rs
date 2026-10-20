@@ -84,6 +84,25 @@ pub(crate) struct QueuedInput {
     pub remote: bool,
 }
 
+/// 「立即/插话」的打断投递在途关联（2026-10-20 二次验收：立即必须打断）：
+/// id = 在途 prompt 命令 id；`interrupt` = 打断槽被取走的条目，被 pi 拒时
+/// 放回槽位。`interrupt: None` = 普通队列 flush（队首仍留在队列里）。
+#[derive(Debug, Clone)]
+pub(crate) struct FlushInFlight {
+    pub id: String,
+    pub interrupt: Option<QueuedInput>,
+}
+
+/// 乐观上屏的待回显条目：文本 + 发送帧的钉顶决定。`pin` 随条目走到回显侧
+/// （message_start user）——空闲普通发送 true；打断投递（立即/Ctrl+Enter）
+/// false：上屏不钉顶，回显升级同样不翻页，否则「上屏不刷屏」会被回显补
+/// 一刀，立即消息照旧把整屏顶出去（2026-10-20 三次验收根因）。
+#[derive(Debug, Clone)]
+pub(crate) struct PendingEcho {
+    pub text: String,
+    pub pin: bool,
+}
+
 /// 033 会话导航面板的一轮摘要（runtime 缓存条目）：用户消息索引 + 前
 /// 50 字，agent 首条有正文回复的 (消息索引, 首行前 50 字)。
 pub(crate) struct TurnSummary {
@@ -142,9 +161,10 @@ pub(crate) struct SessionRuntime {
     /// 晚到（下一轮 turn 边界才emit message_start），所以是列表而非单值；
     /// 匹配也不看「是不是最后一条」——排队的回显前面必然已经堆了本轮的
     /// assistant 消息（2026-10-16 修：单值 + last() 口径下 steer/排队回显
-    /// 必然重复成两条气泡）。
+    /// 必然重复成两条气泡）。`pin` = 发送帧的钉顶决定，随条目走到回显侧
+    /// （[`PendingEcho`]）：打断投递的回显同样不翻页。
     /// 与 phase_waiting 解耦 —— 回显到达 ≠ agent 已应答，等待行不能被它掐掉。
-    pub pending_echoes: Vec<String>,
+    pub pending_echoes: Vec<PendingEcho>,
     /// pi 侧 steering/followUp 队列镜像（`queue_update` 全量快照）：「已排
     /// 队 N 条」状态行不再本地猜。仅显示用——abort 撤回的对账真值来自
     /// `clear_queue` response（pi 权威回传），不读这里。090 后 composer 消息
@@ -157,7 +177,20 @@ pub(crate) struct SessionRuntime {
     /// 在途 flush 的命令 id（Prompt{None} 发出后等 response）：success =
     /// 摘掉队首；failure = pi 忙拒绝，放回队首等下一次 settled 重试。
     /// Some 期间卡片按钮禁用（条目正被取出派发，ZCode dispatch 态 parity）。
-    pub flush_in_flight: Option<String>,
+    pub flush_in_flight: Option<FlushInFlight>,
+    /// 「立即/插话」打断槽（2026-10-20 二次验收）：显式插入 = abort 当前
+    /// 回复 + 条目进槽，本轮 aborted 的 AgentSettled 一到就由 flush 以新
+    /// prompt 发出——模型立刻看到（此前走 pi steer 通道等注入点，纯文本
+    /// 长回复没有边界，54s 故事讲完才被回应）。不渲染卡片：气泡即呈现。
+    pub interrupt_pending: Option<QueuedInput>,
+    /// 流已切断（abort 已发出）：管道里还在飞的旧轮残包（TextDelta/TextEnd/
+    /// ThinkingDelta/ToolCallStart…）到达时，最后一条消息往往已经是乐观追
+    /// 加的打断气泡（User）——`last_assistant` 若照常兜底推新 assistant 壳，
+    /// 残包就在**气泡后面**长出旧内容，气泡视觉上「跳到 agent 输出上方」，
+    /// 要等新轮事件归一才回位（2026-10-20 三次验收）。置位期间残包并入最后
+    /// 一条既有 assistant（ingest.rs `last_assistant`）；新轮 assistant 消息
+    /// 到达 / AgentSettled 清除。
+    pub stream_cut: bool,
     pub stream_started: Option<std::time::Instant>,
     pub agent_running: bool,
     /// 本轮结局（三色通知的红档）：**最后一条 assistant 消息**
@@ -298,6 +331,8 @@ impl SessionRuntime {
             queued_followups: Vec::new(),
             queued_inputs: Vec::new(),
             flush_in_flight: None,
+            interrupt_pending: None,
+            stream_cut: false,
             stream_started: None,
             agent_running: false,
             turn_error: false,
@@ -962,5 +997,183 @@ mod binding_guard_tests {
             assert_eq!(r.file.as_deref(), Some(real.as_path()));
         });
         let _ = std::fs::remove_file(&real);
+    }
+}
+
+#[cfg(test)]
+mod pin_regression_tests {
+    //! 发言钉顶回归锁（2026-10-20）：空闲普通发送 = 发送帧 + 回显双钉顶；
+    //! 打断投递（立即/Ctrl+Enter）全程不钉（上屏与回显同决）；
+    //! stream_cut 残包并入旧 assistant，不得在打断气泡后长出新壳。
+
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn runtime(cx: &mut TestAppContext) -> gpui::Entity<SessionRuntime> {
+        cx.new(|_| {
+            let mut r = SessionRuntime::new("pin-t".into(), PathBuf::from("C:/t"), None);
+            r.sound_on = false;
+            r
+        })
+    }
+
+    fn feed(rt: &gpui::Entity<SessionRuntime>, cx: &mut TestAppContext, ev: Event) {
+        rt.update(cx, |r, cx| r.on_event(ev, cx));
+    }
+
+    fn msg_start(role: &str, text: &str) -> Event {
+        Event::MessageStart {
+            role: role.into(),
+            blocks: vec![pi_link::protocol::Block::Text {
+                content_index: 0,
+                text: text.into(),
+            }],
+            timestamp: None,
+            is_error: false,
+            tool_call_id: None,
+            custom_type: None,
+            custom_display: true,
+            details: None,
+            raw_system: None,
+        }
+    }
+
+    fn text_delta(delta: &str) -> Event {
+        Event::MessageUpdate(pi_link::protocol::AssistantEvent::TextDelta {
+            content_index: 0,
+            delta: delta.into(),
+        })
+    }
+
+    /// 普通发送：发送帧 page_turn，回显按发送帧的 pin=true 再钉（不回退）。
+    #[gpui::test]
+    fn normal_send_echo_keeps_pin(cx: &mut TestAppContext) {
+        let rt = runtime(cx);
+        rt.update(cx, |r, cx| {
+            r.optimistic_send("你好".into(), true, cx);
+            assert_eq!(r.pager.anchor_ix(), Some(0), "发送帧钉顶");
+            assert!(
+                r.pending_echoes.last().is_some_and(|p| p.pin),
+                "普通发送 pin=true 随条目入列"
+            );
+        });
+        feed(&rt, cx, msg_start("user", "你好"));
+        rt.read_with(cx, |r, _| {
+            assert_eq!(r.messages.len(), 1, "回显就地升级，不重复推气泡");
+            assert!(r.pending_echoes.is_empty());
+            assert_eq!(r.pager.anchor_ix(), Some(0), "回显按 pin=true 继续钉顶");
+        });
+    }
+
+    /// 空闲投递（steer 档 Enter / 空闲点立即）= **普通发送**：agent 没在
+    /// 说话无所谓插话，照常发言钉顶，回显继续钉（2026-10-20 验收回归）。
+    #[gpui::test]
+    fn idle_delivery_pins_like_normal_send(cx: &mut TestAppContext) {
+        let rt = runtime(cx);
+        rt.update(cx, |r, cx| {
+            r.queued_inputs.push(QueuedInput {
+                text: "插队".into(),
+                images: Vec::new(),
+                remote: false,
+            });
+            r.queue_send_now(0, cx);
+            assert_eq!(
+                r.pager.anchor_ix(),
+                Some(0),
+                "空闲投递 = 普通发送，照常钉顶"
+            );
+            assert_eq!(r.messages.len(), 1);
+            assert!(r.interrupt_pending.is_some());
+            assert!(!r.stream_cut, "空闲打断无 abort，不置切断标记");
+        });
+        feed(&rt, cx, msg_start("user", "插队"));
+        rt.read_with(cx, |r, _| {
+            assert_eq!(r.messages.len(), 1, "回显就地升级");
+            assert_eq!(r.pager.anchor_ix(), Some(0), "回显继续钉顶");
+        });
+    }
+
+    /// 运行中打断 + abort 在途残包：残包并入旧 assistant（气泡上方收尾），
+    /// 不得在气泡后长新壳；回显升级不钉顶。
+    #[gpui::test]
+    fn stale_deltas_merge_into_old_assistant(cx: &mut TestAppContext) {
+        let rt = runtime(cx);
+        rt.update(cx, |r, cx| {
+            r.on_event(Event::AgentStart, cx);
+            r.on_event(msg_start("assistant", ""), cx);
+            r.on_event(text_delta("旧"), cx);
+        });
+        rt.update(cx, |r, cx| {
+            r.queued_inputs.push(QueuedInput {
+                text: "插".into(),
+                images: Vec::new(),
+                remote: false,
+            });
+            r.queue_send_now(0, cx);
+            assert!(r.stream_cut, "运行中打断置切断标记");
+            assert_eq!(r.pager.anchor_ix(), None, "运行中打断不钉顶（跟流不刷屏）");
+            assert_eq!(r.messages.len(), 2, "assistant + 打断气泡");
+            assert_eq!(
+                r.messages[1].role,
+                crate::session::messages::Role::User,
+                "气泡在末尾"
+            );
+        });
+        // abort 前入管道的残包此刻才到
+        rt.update(cx, |r, cx| {
+            r.on_event(text_delta("残包"), cx);
+        });
+        rt.read_with(cx, |r, _| {
+            assert_eq!(r.messages.len(), 2, "残包不得在气泡后长出新 assistant");
+            let merged = match r.messages[0].blocks.first() {
+                Some(pi_link::protocol::Block::Text { text, .. }) => text.clone(),
+                other => panic!("expected text block, got {other:?}"),
+            };
+            assert!(
+                merged.contains("旧") && merged.contains("残包"),
+                "残包并入旧 assistant：{merged}"
+            );
+            assert_eq!(
+                r.messages[1].role,
+                crate::session::messages::Role::User,
+                "气泡保持在末尾"
+            );
+        });
+        // abort 收尾 → AgentSettled（清切断标记 + flush 槽内条目）→ 新轮回显
+        feed(&rt, cx, Event::AgentSettled);
+        rt.read_with(cx, |r, _| {
+            assert!(!r.stream_cut, "结算清除切断标记");
+        });
+        feed(&rt, cx, msg_start("user", "插"));
+        rt.read_with(cx, |r, _| {
+            assert_eq!(r.messages.len(), 2, "回显升级打断气泡");
+            assert_eq!(r.pager.anchor_ix(), None, "打断回显不钉顶");
+        });
+    }
+
+    /// 用户报障回归锁（2026-10-21）：首条消息已钉顶、agent 思考中再发一条
+    /// steer——打断投递不得退役钉顶锚点。钉顶期（内容还短于一屏）退役 = 摘
+    /// 垫片，Bottom 胶水把整块内容拽到屏底（「所有消息落到屏幕下半部分」）。
+    /// 几何锁见 chat_list.rs `interrupt_while_pinned_keeps_position`。
+    #[gpui::test]
+    fn steer_while_pinned_keeps_anchor(cx: &mut TestAppContext) {
+        let rt = runtime(cx);
+        rt.update(cx, |r, cx| {
+            r.optimistic_send("第一条".into(), true, cx);
+            assert_eq!(r.pager.anchor_ix(), Some(0), "首条照常钉顶");
+            r.agent_running = true;
+            r.input = "第二条".into();
+            r.steer_input(cx);
+        });
+        rt.read_with(cx, |r, _| {
+            assert_eq!(
+                r.pager.anchor_ix(),
+                Some(0),
+                "钉顶期打断不退役锚点（昵了就落到屏幕下半部）"
+            );
+            assert_eq!(r.messages.len(), 2, "插话气泡接在下面");
+            assert_eq!(r.messages[1].role, crate::session::messages::Role::User);
+            assert!(r.interrupt_pending.is_some(), "打断槽持有本条");
+        });
     }
 }

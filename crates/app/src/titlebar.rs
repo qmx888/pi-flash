@@ -103,7 +103,7 @@ pub const CAPTION_FONT: &str = "Segoe Fluent Icons";
 /// 右端手机遥控钮已隐藏（2026-10-10 用户定夺；重开走 git 历史找回 wx_btn）。
 pub(crate) fn topbar_l(_chat: &mut Chat, cx: &mut gpui::Context<Chat>) -> impl gpui::IntoElement {
     let t = T();
-    div()
+    let mut bar = div()
         .id("topbar-l")
         .h(px(HEIGHT))
         .flex_shrink_0()
@@ -117,10 +117,13 @@ pub(crate) fn topbar_l(_chat: &mut Chat, cx: &mut gpui::Context<Chat>) -> impl g
             cx.listener(|this, _: &gpui::MouseDownEvent, _w, cx| {
                 this.toggle_panes(cx);
             }),
-        )))
-        // 040-1 「菜单」三横钮（紧贴收放钮右侧）：目前只有「Pi扩展市场」
-        // 一项，浮层渲染挂 render.rs 根（dlg.market_menu = 按钮锚点）。
-        .child(div().ml(px(space::SP2)).child(icon_btn(
+        )));
+    // 040-1 「菜单」三横钮（紧贴收放钮右侧）：目前只有「Pi扩展市场」
+    // 一项，浮层渲染挂 render.rs 根（dlg.market_menu = 按钮锚点）。
+    // **本版隐藏**：市场页还没收拾干净，入口走 dev-flags
+    // `pi_ext_market` 开关（默认关 = 发版不可见），开才渲染这个钮。
+    if crate::services::workspace::pi_ext_market_enabled() {
+        bar = bar.child(div().ml(px(space::SP2)).child(icon_btn(
             "market-menu",
             "menu",
             tr("titlebar.menu"),
@@ -128,7 +131,9 @@ pub(crate) fn topbar_l(_chat: &mut Chat, cx: &mut gpui::Context<Chat>) -> impl g
                 this.dlg.market_menu = Some((f32::from(ev.position.x), f32::from(ev.position.y)));
                 cx.notify();
             }),
-        )))
+        )));
+    }
+    bar
         // drag filler: the empty middle is the drag region (HTCAPTION —
         // platform handles move + double-click-zoom)
         .child(

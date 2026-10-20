@@ -352,8 +352,8 @@ fn plugin_row(
     if project {
         row = row.child(tag(
             crate::i18n::tr("scope.project"),
-            crate::settings::widgets::indigo_bg(),
-            crate::settings::widgets::indigo_fg(),
+            crate::ui::kit::indigo_bg(),
+            crate::ui::kit::indigo_fg(),
         ));
     }
     if let Some(n) = tokens {

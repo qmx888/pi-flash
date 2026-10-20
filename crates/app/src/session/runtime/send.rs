@@ -41,45 +41,25 @@ impl SessionRuntime {
     /// 走 prompt + streamingBehavior:"steer"（pi-web onPromptWithStreamingBehavior
     /// parity）：排队与否由 pi 原子判定；裸 steer 落在空闲 agent 的 steering
     /// 队列里同样会滞留到下一轮中途才插话。
+    /// 插话模式 Enter / queue 模式 Ctrl+Enter / pif-ui `session.steer`——
+    /// **打断投递**（2026-10-20 用户定稿规则 3：立即 = 中止当前 agent 轮次、
+    /// 重新下达指令）。运行中 abort 当前回复、本条立刻作为新一轮发出；空闲
+    /// 直接开跑。机制见 queue.rs `interrupt_deliver`。
     pub(crate) fn steer_input(&mut self, cx: &mut Context<Self>) {
-        let text = self.input.trim().to_string();
-        if text.is_empty() && self.pending_images.is_empty() {
+        // 压缩锁：UI 已锁死，这里是绕过 UI 调用的兜底
+        if self.compacting {
             return;
         }
-        let images: Vec<serde_json::Value> = self
-            .pending_images
-            .iter()
-            .map(|img| {
-                serde_json::json!({
-                    "type": "image", "data": img.data_b64, "mimeType": img.mime
-                })
-            })
-            .collect();
-        match self.agent.session.as_ref().map(|session| {
-            session.send(&Command::Prompt {
-                message: text.clone(),
-                images,
-                streaming_behavior: Some("steer".into()),
-            })
-        }) {
-            Some(Ok(_)) => {
-                self.input.clear();
-                self.pending_images.clear();
-                if !text.is_empty() && !text.starts_with("/skill:") {
-                    self.optimistic_send(text, cx);
-                } else {
-                    cx.notify();
-                }
-            }
-            Some(Err(e)) => self.status = e,
-            None => {}
-        }
+        self.interrupt_from_composer(cx);
     }
 
-    /// 乐观上屏 + 发送帧翻页（prompt/排队共用，pi-web optimistic user
-    /// message parity）：气泡立即显示并钉视口顶，RPC 回显经 pending_echo
-    /// 去重就地升级。
-    pub(super) fn optimistic_send(&mut self, text: String, cx: &mut Context<Self>) {
+    /// 乐观上屏（prompt/排队共用，pi-web optimistic user message parity）：
+    /// 气泡立即显示，RPC 回显经 pending_echo 去重就地升级。`pin` = 是否发言
+    /// 钉顶（page_turn）——**空闲普通发送**钉顶；打断投递传 false：不翻页，
+    /// 消息跟在流后面、视图保持贴底跟随（2026-10-20 用户定稿「打断消息
+    /// 不要刷屏，跟在流后面」）。`pin` 记进 pending_echo 随条目走：回显到
+    /// 达（message_start user）按同一决定行事，不再无条件补一次 page_turn。
+    pub(super) fn optimistic_send(&mut self, text: String, pin: bool, cx: &mut Context<Self>) {
         // 伪标签：还没绑定会话文件的 draft，乐观发送的同一帧就在侧栏挂标
         // 签（真标签要等 pi 落盘 + 磁盘扫描，进程冷启 1-3s）。prompt/排队/
         // 微信远程三个入口共用本漏斗；已绑定会话被 file 守卫挡掉。
@@ -92,7 +72,10 @@ impl SessionRuntime {
                 .to_string();
             cx.emit(SessionEvent::PendingTab(Some(preview)));
         }
-        self.pending_echoes.push(text.clone());
+        self.pending_echoes.push(PendingEcho {
+            text: text.clone(),
+            pin,
+        });
         self.messages.push(Msg {
             role: Role::User,
             bash: None,
@@ -112,12 +95,17 @@ impl SessionRuntime {
             model: None,
         });
         self.phase_waiting = true;
-        // 发送帧翻页：新用户消息立即钉视口顶、历史滚出屏，不等回显不等
-        // bounds（page_turn 内部完成 sync 落账）
-        let ix = self.messages.len() - 1;
-        let msgs = self.messages.len();
-        let phase = self.phase_row_visible();
-        self.pager.page_turn(ix, msgs, phase);
+        // 钉顶：新用户消息立即钉视口顶、历史滚出屏，不等回显不等 bounds
+        // （page_turn 内部完成 sync 落账）。不钉顶（打断投递）：notify_list
+        // 做结构同步即可，视口停在贴底跟随位，消息自然跟在流尾部
+        if pin {
+            let ix = self.messages.len() - 1;
+            let msgs = self.messages.len();
+            let phase = self.phase_row_visible();
+            self.pager.page_turn(ix, msgs, phase);
+        } else {
+            self.notify_list(cx);
+        }
         cx.notify();
     }
 
@@ -172,7 +160,7 @@ impl SessionRuntime {
                 // 技能命令不做乐观回显（pi-web parity）：RPC 回显的是展开信封
                 // 文本，乐观插入裸 "/skill:xxx" 会多出一条重复气泡
                 if !text.is_empty() && !text.starts_with("/skill:") {
-                    self.optimistic_send(text, cx);
+                    self.optimistic_send(text, true, cx);
                 }
             }
             Err(e) => {
@@ -201,9 +189,15 @@ impl SessionRuntime {
         // 通路（clear_queue response 异步 / 本地同步）互不重叠。
         let (recalled, images) = self.restore_queue_to_editor();
         if !recalled.is_empty() || !images.is_empty() {
-            cx.emit(SessionEvent::RecallInput { text: recalled, images });
+            cx.emit(SessionEvent::RecallInput {
+                text: recalled,
+                images,
+            });
         }
         self.stream_started = None;
+        // 与 interrupt_deliver 同款在途竞态：Esc 停止后旧流残包仍在管道里，
+        // 紧接着的发送（乐观气泡）后面不得长出旧内容（stream_cut 字段注释）
+        self.stream_cut = true;
         // 中止：等待行立即收起（不等 agent_settled）
         self.phase_waiting = false;
         // pending_echoes **不在此清**：撤回的条目由 clear_queue response 臂
@@ -436,12 +430,12 @@ impl SessionRuntime {
         if !self.ensure_spawned(cx) {
             return;
         }
-        let Some(session) = &self.agent.session else {
+        if self.agent.session.is_none() {
             self.status = tr("status.disconnected").into();
             cx.notify();
             return;
-        };
-        // `!` / `!!` shell 命令（031）：不经 prompt/steer，走 rpc bash。
+        }
+        // `!` / `!!` shell 命令（031）：不经 prompt/插话，走 rpc bash。
         // 带图片时 ! 只当普通文本（pi-web bashMode 需无附件）。
         if self.pending_images.is_empty() && text.starts_with('!') {
             self.send_bash(&text, cx);
@@ -456,62 +450,56 @@ impl SessionRuntime {
             cx.notify();
             return;
         }
-        // 090 排队护栏（2026-10-20 定批，修订 2026-10-16「统一走 pi 排队」）：
-        // queue 模式（默认）一律扣 **PF 本地队列**——pi 的 followUp 在
-        // would-stop 点（run 内）就 drain，是「排队插队」的根源；空闲场景也
-        // 走入队+flush（发 Prompt{None}），pi 实际在跑（AgentEnd..Settled
-        // 续跑窗）时会响亮拒绝而非静默入队，猜测误差不再变成插队。
+        // 规则 1+2（2026-10-20 终稿）：仅**运行中**才进缓冲（轮次结束自动
+        // 发出；缓冲非空时 enqueue 内部拒绝）。空闲 = 直接发送，不经过缓冲
+        // ——「前面没话」时缓冲毫无意义。
         if self.queue_mode() {
-            self.enqueue_from_composer(text, cx);
-            self.flush_local_queue(cx);
+            if self.agent_running {
+                self.enqueue_from_composer(text, cx);
+                cx.notify();
+                return;
+            }
+            let images: Vec<serde_json::Value> = self
+                .pending_images
+                .iter()
+                .map(|img| {
+                    serde_json::json!({
+                        "type": "image",
+                        "data": img.data_b64,
+                        "mimeType": img.mime
+                    })
+                })
+                .collect();
+            let cmd = Command::Prompt {
+                message: text.clone(),
+                images,
+                // pi 原子判定：恰有 run 溜进（AgentEnd..Settled 续跑窗）时
+                // pi 侧 followUp 接住，与本任务同源
+                streaming_behavior: Some("followUp".into()),
+            };
+            match self.agent.session.as_ref().map(|s| s.send(&cmd)) {
+                Some(Ok(_)) => {
+                    if !text.is_empty() && self.history.last().map(|h| h != &text).unwrap_or(true) {
+                        self.remember_input(text.clone());
+                    }
+                    self.history_ix = None;
+                    self.input.clear();
+                    self.pending_images.clear();
+                    self.status = "running".into();
+                    // 技能命令不做乐观回显（pi-web parity）
+                    if !text.is_empty() && !text.starts_with("/skill:") {
+                        self.optimistic_send(text, true, cx);
+                    }
+                }
+                Some(Err(e)) => self.status = e,
+                None => {}
+            }
             cx.notify();
             return;
         }
-        // steer 模式（显式插话）：空闲 = prompt 立即开跑，运行中 = steer 插进
-        // 当前轮。仍走统一 prompt + streamingBehavior 通路（pi 原子判定，
-        // 理由见 protocol.rs Prompt 注释），只是把队列档换成显式插话档。
-        let streaming = self.agent_running || self.state.as_ref().is_some_and(|s| s.is_streaming);
-        let images: Vec<serde_json::Value> = self
-            .pending_images
-            .iter()
-            .map(|img| {
-                serde_json::json!({
-                    "type": "image",
-                    "data": img.data_b64,
-                    "mimeType": img.mime
-                })
-            })
-            .collect();
-        let cmd = Command::Prompt {
-            message: text.clone(),
-            images,
-            streaming_behavior: Some(if streaming { "steer" } else { "followUp" }.into()),
-        };
-        match session.send(&cmd) {
-            Ok(_) => {
-                // 纯图片发送不进历史、不做乐观回显（空文本气泡无内容可显，
-                // 等 RPC 回显带图的完整用户消息）
-                if !text.is_empty() && self.history.last().map(|h| h != &text).unwrap_or(true) {
-                    self.remember_input(text.clone());
-                }
-                self.history_ix = None;
-                self.input.clear();
-                self.pending_images.clear();
-                self.status = if streaming {
-                    tr("status.steered").into()
-                } else {
-                    "running".into()
-                };
-                // 技能命令不做乐观回显（pi-web parity）：RPC 回显的是展开
-                // 信封文本（渲染层折叠成紧凑命令），乐观插入裸 "/skill:xxx"
-                // 会多出一条重复气泡。prompt 与插话一致——发送帧即上屏
-                // 翻页，不等回显
-                if !text.is_empty() && !text.starts_with("/skill:") {
-                    self.optimistic_send(text, cx);
-                }
-            }
-            Err(e) => self.status = e,
-        }
+        // steer 模式（规则 3）：显式插入 = **打断**——中止当前轮次，草稿立刻
+        // 作为新一轮指令发出（空闲同样直接开跑），不再走 pi steer 注入通道。
+        self.interrupt_from_composer(cx);
         cx.notify();
     }
 
@@ -530,40 +518,50 @@ impl SessionRuntime {
         if !self.ensure_spawned(cx) {
             return false;
         }
-        let Some(session) = &self.agent.session else {
+        if self.agent.session.is_none() {
             self.status = tr("status.disconnected").into();
             cx.notify();
             return false;
-        };
-        // 090：queue 模式（默认）与 composer 同一漏斗——扣本地队列等
-        // AgentSettled 逐条发；steer 模式运行中 = steer 插话。空闲都由
-        // pi 原子判定直接开跑。
-        let streaming = self.agent_running || self.state.as_ref().is_some_and(|s| s.is_streaming);
-        if self.queue_mode() {
+        }
+        // 规则 1+2：仅**运行中**才入缓冲（空闲直接发送，不经过缓冲）。
+        if self.queue_mode() && self.agent_running {
+            let queued = !self.queued_inputs.is_empty();
             self.enqueue_remote(text.clone(), cx);
-            self.flush_local_queue(cx);
             cx.notify();
+            return !queued;
+        }
+        // steer 模式运行中（规则 3）：打断投递——中止当前轮，本条作为新一轮。
+        if !self.queue_mode() && self.agent_running {
+            if self.history.last().map(|h| h != &text).unwrap_or(true) {
+                self.remember_input(text.clone());
+            }
+            self.history_ix = None;
+            self.interrupt_deliver(
+                QueuedInput {
+                    text,
+                    images: Vec::new(),
+                    remote: true,
+                },
+                cx,
+            );
             return true;
         }
+        // 空闲（两模式同条）：直接发送，pi 原子判定。
         let cmd = Command::Prompt {
             message: text.clone(),
             images: Vec::new(),
-            streaming_behavior: Some(if streaming { "steer" } else { "followUp" }.into()),
+            streaming_behavior: Some("followUp".into()),
         };
-        let sent = session.send(&cmd).is_ok();
+        let sent = self.rpc(&cmd);
         if sent {
             if self.history.last().map(|h| h != &text).unwrap_or(true) {
                 self.remember_input(text.clone());
             }
             self.history_ix = None;
-            self.status = if streaming {
-                tr("status.steered").into()
-            } else {
-                "running".into()
-            };
+            self.status = "running".into();
             // 让桌面端也看到这条消息（微信发的同样属于这轮对话）
             if !text.starts_with("/skill:") {
-                self.optimistic_send(text, cx);
+                self.optimistic_send(text, true, cx);
             }
         } else {
             self.status = tr("status.send_failed").into();
@@ -591,22 +589,39 @@ impl SessionRuntime {
         ok
     }
 
-    /// LLM session title (pi-web lib/session-title.ts parity via a one-off
-    /// `pi --no-session --print` run; the in-process SDK call pi-web uses is
-    /// not reachable over RPC).
+    /// 思考档换挡（胶囊菜单 / 微信菜单同源）。
+    ///
+    /// `level` 是 pi 的档位键。pi 会按模型能力**截断**（deepseek-flash 只有
+    /// off/low/high/max），真值随 `thinking_level_changed` 事件回来，本地这
+    /// 里先乐观回填状态槽（不然胶囊要等下一次 `get_state` 才动，看起来像
+    /// 「没换过去」）。
     pub(crate) fn set_thinking_level(&mut self, level: &str, cx: &mut Context<Self>) {
-        if level == "auto" {
-            self.thinking_override = None;
-            cx.notify();
-            return;
-        }
         self.thinking_override = Some(level.to_string());
+        self.push_thinking_level(level);
+        cx.notify();
+    }
+
+    /// 「使用 pi 默认设置」（菜单 auto）：override 清空（打勾留在 auto），但
+    /// pi 端**没有** auto 档——只清本地标志等于点了没反应（真机：换到 low
+    /// 再选 auto，pi 仍停在 low、胶囊也不动）。所以由调用方按 pi 设置解出
+    /// 默认档（[`pi_link::config::PI_DEFAULT_THINKING_LEVEL`] 兜底）显式下发。
+    pub(crate) fn set_thinking_auto(&mut self, default: &str, cx: &mut Context<Self>) {
+        self.thinking_override = None;
+        self.push_thinking_level(default);
+        cx.notify();
+    }
+
+    /// 乐观回填状态槽 + 下发 rpc。没有进程（空闲回收/草稿）时就只落本地：
+    /// 下次 spawn 用 `--thinking <override>` 带上。
+    fn push_thinking_level(&mut self, level: &str) {
+        if let Some(st) = self.state.as_mut() {
+            st.thinking_level = Some(level.to_string());
+        }
         if let Some(session) = &self.agent.session {
             let _ = session.send(&Command::SetThinkingLevel {
                 level: level.to_string(),
             });
         }
-        cx.notify();
     }
 
     pub(crate) fn select_model(&mut self, provider: String, id: String, cx: &mut Context<Self>) {

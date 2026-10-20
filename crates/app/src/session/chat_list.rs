@@ -37,7 +37,8 @@
 //! `free_scroll`，暂停 sync 第 6 步重钉与跟尾翻转拽底，**锚点与垫片保留**——
 //! 微滚就是平滑滑动，滚回贴底（几何上≡钉顶位）自动恢复钉顶，读历史不被流式
 //! 拽走；长回复照常由 settle_spacer 归零垫片、交还胶水跟尾。真正的退役
-//! （`release`）只留给发送失败 / fork / 整表重读等重置场景。
+//! （`release` / 打断投递的 [`ChatList::release_if_following`]）只留给发送
+//! 失败 / fork / 整表重读等重置场景——钉顶期退役必把短内容拽到屏底。
 //!
 //! 同步入口只有 [`ChatList::sync`]：增删走 splice（保逻辑滚动位），整体重排
 //! 才 reset。
@@ -410,6 +411,27 @@ impl ChatList {
     /// 普通滚轮走 free_scroll 软状态，不进这里。
     pub(crate) fn release(&self) {
         self.core.detach(&self.state);
+    }
+
+    /// 打断投递（运行中插话）的锚点处置：**只在跟尾期退役**，钉顶期原样保留。
+    ///
+    /// 跟尾期退役是有意义的：垫片早已归零（不承载几何，卸掉不跳），而锚点一
+    /// 退役就不会在轮末内容缩水（思考/工具折进「工作详情」）时被
+    /// [`ChatList::settle_spacer`] 翻回钉顶、把视口拽回上一轮的用户消息。
+    ///
+    /// 钉顶期（内容还短于内容区）绝不能退役：垫片是一整屏内容区高，摘掉它
+    /// `layout_items` 的覆盖条件立刻成立 → 逻辑位被夺、Bottom 胶水把**整块
+    /// 短内容拽到屏底**（用户报障：首条消息已钉顶、agent 思考中再发一条 steer，
+    /// 所有消息落到屏幕下半部分）。钉顶期保留锚点则消息只是追加在下面——内容
+    /// 还装在一屏里，几何原地不动，等新回复长过内容区再交还胶水跟尾。
+    ///
+    /// 返回是否真的退役了（调用方日志/断言用）。
+    pub(crate) fn release_if_following(&self) -> bool {
+        if self.core.anchor.get().is_none() || !self.core.following.get() {
+            return false;
+        }
+        self.core.detach(&self.state);
+        true
     }
 
     /// 垫片结算：唯一定「钉顶 or 跟尾」的地方（垫片取值见 [`spacer_target`]）。
@@ -1015,6 +1037,58 @@ mod glue_geometry {
         assert!(!pager.anchor_active()); // 锚点退役、垫片卸掉
         assert_eq!(pager.state().item_count(), heights.len());
         assert!(top(&items, 1).unwrap() > px(300.)); // 用户消息掉到屏幕下半部
+    }
+
+    /// 用户报障回归锁（2026-10-21）：首条消息发出 → 钉顶、agent 思考中再发
+    /// 一条 steer（运行中打断投递）——打断**只能在跟尾期**退役锚点。钉顶期
+    /// 退役就是摘垫片：内容还短于一屏，Bottom 胶水把整块内容拽到屏底（与上一
+    /// 例的反例同几何）——用户原话「所有消息落到了屏幕下半部分」。
+    #[gpui::test]
+    fn interrupt_while_pinned_keeps_position(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        let seen: Rc<RefCell<Vec<(usize, Bounds<Pixels>)>>> = Default::default();
+        let pager = Rc::new(ChatList::new());
+
+        // 首条用户消息：发送帧钉顶（还带着等待行）
+        let mut heights = vec![80.];
+        pager.reload(heights.len());
+        paint(window, &pager, &seen, &heights, false);
+        pager.page_turn(0, heights.len(), true);
+        paint(window, &pager, &seen, &heights, true);
+        let items = step(window, &pager, &seen, &heights, true);
+        assert_eq!(pager.spacer_px(), AVAIL);
+        assert_eq!(top(&items, 0), Some(px(PAD_TOP)));
+
+        // 思考中插话（运行中打断）：钉顶期不退役锚点，气泡只是追加在下面
+        assert!(!pager.release_if_following(), "钉顶期打断不得退役锚点");
+        heights.push(60.);
+        let items = step(window, &pager, &seen, &heights, true);
+        assert!(pager.anchor_active());
+        assert_eq!(pager.spacer_px(), AVAIL);
+        assert_eq!(
+            top(&items, 0),
+            Some(px(PAD_TOP)),
+            "首条用户消息仍钉在 padding.top"
+        );
+        assert_eq!(
+            top(&items, 1),
+            Some(px(PAD_TOP + 80.)),
+            "插话气泡接在其下，几何原地没动"
+        );
+
+        // 新回复流式（等待行收起）并长过内容区 → 跟尾；此后插话才退役锚点
+        step(window, &pager, &seen, &heights, false);
+        heights.push(1200.);
+        step(window, &pager, &seen, &heights, false);
+        let items = step(window, &pager, &seen, &heights, false);
+        assert_eq!(pager.spacer_px(), 0.);
+        assert_eq!(bottom(&items, 2), Some(px(VIEWPORT - PAD_BOTTOM)));
+
+        // 跟尾期插话：锚点照常退役（垫片已归零，几何纹丝不动）
+        assert!(pager.release_if_following());
+        assert!(!pager.anchor_active());
+        let items = paint(window, &pager, &seen, &heights, false);
+        assert_eq!(bottom(&items, 2), Some(px(VIEWPORT - PAD_BOTTOM)));
     }
 
     /// 用户报障回归锁：跟尾期（内容长过内容区）读历史后点「回到最新」，必须

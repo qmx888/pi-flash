@@ -2,6 +2,50 @@
 
 All notable changes to released versions live here; see `docs/CHANGELOG规范.md` for the format.
 
+## [0.2.1] - 2026-10-20
+
+This release focuses on crash fixes and performance:
+the Chinese markdown editor "process vanishes instantly" crash is fixed;
+crashes caused by typing `exit` in the terminal are gone;
+the session send-queue system ships — "Queue / Steer" modes configurable while the agent runs;
+memory usage optimizations;
+and lag when opening very large file directories is fixed.
+
+### Install & Update
+
+```bash
+npm install -g pi-flash@latest   # same command for first install and updates
+pi-flash
+```
+
+Requires Node.js ≥ 22.19.
+A zip portable build is also available: download, unzip, double-click `pi-flash.exe` — no Node needed.
+Windows x64 only.
+
+### New
+
+- Session send-queue: messages sent while the agent is running no longer "always cut in line" — by default they enter a local queue and go out automatically when the current turn ends; the queue card sits above the input panel and supports drag-to-reorder, pencil recall-to-edit, "Send now" interrupt, and trash delete; sending is blocked while the buffer already holds a queued message; the stop button recalls queued messages too; ESC cancels the queue; WeChat remote sends go through the same funnel. Settings → Other adds "Send behavior while running" with two modes: Queue (default) / Steer. (aa5c4fc, 551fa2b, edc23ce, 8f6a1cf, 14e6059, 3367977)
+- "Steer / Send now" now means interrupt: the current reply is aborted immediately and re-issued as a new instruction; the half-finished reply stays on screen and the new message continues with that context. (edc23ce)
+- Infrequently used icons in the session / file-tree action bars auto-hide and reveal on hover; Settings → Interface adds an "Auto-hide icons" switch (on by default; turn it off to keep icons always visible, effective immediately). (98cbd72, 4bf8673)
+
+### Bug fixes
+
+- Chinese markdown editing killed the process instantly: the window vanished with no error while editing Chinese articles (three real-machine crashes in a row; autosave saved the content) — the vendored editor's tree-sitter highlight callback sliced raw bytes, and a dirty offset landing inside a 3-byte Han character panicked across an `extern "C"` boundary (cannot unwind → abort); the root cause was the IME composition update computing its selection base from the wrong end of the replaced range. Fixed with a char-boundary guard in the callback plus the corrected selection base. (6e9af0e)
+- Interrupts while running: an interjection during thinking dragged the whole message screen into the lower half (interrupts now only retire the tail-follow anchor); pinned-to-top is now decided by "was it a real interrupt"; echoes no longer double-post; stray stream_cut fragments merge back into the old reply. (92ff894, 0343a22)
+- The thinking-level capsule kept showing the old level after switching (on real machines it always showed high). (3ae6f31)
+- Terminal: painting right after the terminal area shrank read stale row counts and crashed; a bare `exit` + Enter no longer kills the parent shell — it now closes the terminal tab. (faf8987, c4d0aa1)
+- Image bubbles no longer show the `[Image: original …]` coordinate caption. (5947554)
+- File tree froze when expanding a repo opened via a subdirectory: git status / numstat paths are now anchored to the repo root. (0eefea6)
+- The context-usage popup is 40px wider (420 → 460), so the bottom three buttons no longer overflow in English. (2a73342)
+- Extension detail status no longer prints raw update-check error strings; the "Extensions" settings nav item is back (it was hidden when the market page shipped). (bd21660, 6d26f83)
+- Idle sends no longer wrongly enter the send queue; the "back to latest" button in the chat list no longer fails while tail-following. (b2a56a3, 6a1dfb1)
+
+### Improvements
+
+- Memory usage: decoded-bitmap cache entries are now evicted lazily (root fix for image-heavy long sessions where memory only grew); idle reclamation now retires runtime entities too. (1f66410, b655602)
+- Completed Traditional Chinese / English translations for the model page and "Add Provider" texts. (2042423, 271b653, 2cb104a)
+- Shortcuts page simplified: inline explanatory notes removed, leaving titles and keycaps. (af86124, 65fe2da)
+- Removed the "Reset" button from the session content width setting. (d64e64e)
 ## [0.2.0] - 2026-10-18
 
 This release focuses on: performance — the giant-session lag is fixed at its root (a 688-message session drops from O(turns) to O(viewport) per frame, composer typing no longer repaints the whole window per keystroke, and the send freeze is gone); three major features — session pinning, Pi extension update detection, and session auto-cleanup; free tab drag & drop on the topbar (Zed-style); and mid-session RPC stops are no longer silent.

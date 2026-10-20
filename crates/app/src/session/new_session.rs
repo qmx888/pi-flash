@@ -347,11 +347,11 @@ fn plugin_update_notice(
     } else {
         format!("{}({n})", tr("extensions.update_all"))
     };
-    let btn = crate::settings::widgets::config_button(
+    let btn = crate::ui::kit::config_button(
         "ns-pkg-update-all",
         weak,
         &label,
-        crate::settings::widgets::Btn::Secondary,
+        crate::ui::kit::Btn::Secondary,
         true,
         chat.cfg.pkg_op.is_some(),
         |c, cx| c.mc_update_all_packages(cx),

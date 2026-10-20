@@ -1,3 +1,23 @@
+## 待验证（本轮修复）——思考中插话，整屏消息落到屏幕下半部分
+
+用户口径：首条消息发出后已钉顶，agent 思考中再发一条 steer（插话），结果所有
+消息落到屏幕下半部分。
+
+- ✅ 根因：上一轮「发言钉顶按是否真打断决定」把打断投递的处置写成**无条件**
+  `pager.release()`——钉顶期（锚下内容还短于一屏）退役 = 摘掉那一整屏垫片，
+  `layout_items` 的覆盖条件 `pt + below + spacer + pb < H` 立刻成立 → 逻辑位
+  被夺 → Bottom 胶水把整块短内容拽到 `屏底 − PAD_BOTTOM`。
+  `reload_keeps_pin_or_falls_to_bottom` 的反例（「用户消息掉到屏幕下半部」）
+  早就是这个几何，只是当时没把打断投递接上。
+- ✅ 修法：打断只退役**跟尾期**的锚点（新 `ChatList::release_if_following`）——
+  跟尾期垫片已归零，卸掉不跳，且轮末内容缩水时不会被 `settle_spacer` 翻回钉顶
+  把视口拽回上一轮的用户消息；钉顶期保留锚点，插话气泡只是追加在当前屏内内容
+  之后，几何原地不动，新回复长过一屏再交还胶水跟尾。
+- ✅ 验证：`chat_list::glue_geometry::interrupt_while_pinned_keeps_position`
+  （真 gpui 布局：钉顶期插话首条仍钉 `padding.top`、气泡接在其下；跟尾期退役
+  不跳）+ `pin_regression_tests::steer_while_pinned_keeps_anchor`（打断不再无条件
+  release）；`cargo test -p app` 324 全绿。
+
 ## 待验证（本轮修复）——展开文件夹卡几秒（真凶：git status 无 pathspec 扫整仓 270 万条）
 
 外部用户实测报告：`docs/pi-flash-file-tree-freeze-20261019/`（含复现脚本与

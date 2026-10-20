@@ -332,9 +332,9 @@ pub(crate) fn group_model_row(
                         .px(px(4.))
                         .py(px(1.))
                         .rounded(px(3.))
-                        .bg(crate::settings::widgets::indigo_bg())
+                        .bg(crate::ui::kit::indigo_bg())
                         .text_size(ui(9.))
-                        .text_color(crate::settings::widgets::indigo_fg())
+                        .text_color(crate::ui::kit::indigo_fg())
                         .child(SharedString::from(p))
                         .into_any_element()
                 })),

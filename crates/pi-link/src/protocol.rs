@@ -811,8 +811,16 @@ pub enum Event {
         steering: Vec<String>,
         follow_up: Vec<String>,
     },
+    /// `thinking_level_changed`：思考档**实际**落地后的广播（pi
+    /// `setThinkingLevel` 的 level 会被模型能力截断——deepseek-flash 只有
+    /// off/low/high/max，请求 `minimal` 真值是 `low`、请求 `medium` 是
+    /// `high`）。档位变更是这个事件的唯一权威来源：`get_state` 只在轮末/
+    /// 换模型时问一次，且 set_thinking_level 的 response **不带** level。
+    ThinkingLevelChanged {
+        level: String,
+    },
     /// pi 会话事件中 app 暂不消费的杂项（tool_execution_* /
-    /// entry_appended / session_info_changed / thinking_level_changed）：
+    /// entry_appended / session_info_changed）：
     /// 解析出 type 免落 [`Event::Unparsed`] 噪声，字段留原 Value。
     WireEvent {
         kind: String,
@@ -1221,14 +1229,16 @@ pub fn parse_record(v: &Value) -> Event {
             steering: string_list(&v["steering"]),
             follow_up: string_list(&v["followUp"]),
         },
+        Some("thinking_level_changed") => Event::ThinkingLevelChanged {
+            level: v["level"].as_str().unwrap_or_default().to_string(),
+        },
         // app 暂不消费的会话事件：按 type 归类为 WireEvent，别落 Unparsed
         Some(
             "tool_execution_start"
             | "tool_execution_update"
             | "tool_execution_end"
             | "entry_appended"
-            | "session_info_changed"
-            | "thinking_level_changed",
+            | "session_info_changed",
         ) => Event::WireEvent {
             kind: v["type"].as_str().unwrap_or("").to_string(),
             value: v.clone(),
@@ -2060,7 +2070,6 @@ mod tests {
             "tool_execution_end",
             "entry_appended",
             "session_info_changed",
-            "thinking_level_changed",
         ] {
             let line = format!(r#"{{"type":"{kind}"}}"#);
             let e = parse_line(&line).unwrap();
@@ -2069,6 +2078,13 @@ mod tests {
             };
             assert_eq!(k, kind);
         }
+        // thinking_level_changed：pi 截断后的**真值**（请求 minimal → low）
+        assert_eq!(
+            parse_line(r#"{"type":"thinking_level_changed","level":"low"}"#).unwrap(),
+            Event::ThinkingLevelChanged {
+                level: "low".into()
+            }
+        );
         // 真正未知的 type 仍落 Unparsed
         assert!(matches!(
             parse_line(r#"{"type":"wat"}"#),

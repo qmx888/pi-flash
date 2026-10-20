@@ -16,8 +16,8 @@
 use gpui::Context;
 use pi_link::protocol::Command;
 
-use crate::i18n::{tf, tr};
 use crate::AttachedImage;
+use crate::i18n::{tf, tr};
 
 use super::*;
 
@@ -60,14 +60,25 @@ impl SessionRuntime {
     }
 
     fn set_queued_status(&mut self) {
-        self.status = tf("status.queued_n", &[("count", self.queue_total().to_string())]);
+        self.status = tf(
+            "status.queued_n",
+            &[("count", self.queue_total().to_string())],
+        );
     }
 
     /// composer 发送入队（queue 模式的 send_input 漏斗）：入队 + 清输入/
     /// 附件 + 进 ↑ 历史。**不上屏不进 pending_echoes**——排队期以卡片呈现
     /// （不进气泡流，ZCode parity），flush 后 pi 的 message_start 回显才是
     /// 气泡的唯一来源，回显去重负担随之消失。
+    ///
+    /// 规则 2（2026-10-20 用户定稿）：**缓冲栏有内容时无法继续发送消息**——
+    /// 拒绝入队、草稿原样保留；转 Ctrl+Enter 立即打断（规则 3）或先处理卡片。
     pub(crate) fn enqueue_from_composer(&mut self, text: String, cx: &mut Context<Self>) {
+        if !self.queued_inputs.is_empty() {
+            self.status = tr("queue.full").into();
+            cx.notify();
+            return;
+        }
         let images = std::mem::take(&mut self.pending_images);
         self.queued_inputs.push(QueuedInput {
             text: text.clone(),
@@ -84,7 +95,13 @@ impl SessionRuntime {
     }
 
     /// 微信远程入队（与 composer 同一漏斗；不碰 self.input/pending_images）。
-    pub(crate) fn enqueue_remote(&mut self, text: String, cx: &mut Context<Self>) {
+    /// 规则 2 同样适用：缓冲非空拒绝，返回 false（调用方按未送达口径处理）。
+    pub(crate) fn enqueue_remote(&mut self, text: String, cx: &mut Context<Self>) -> bool {
+        if !self.queued_inputs.is_empty() {
+            self.status = tr("queue.full").into();
+            cx.notify();
+            return false;
+        }
         self.queued_inputs.push(QueuedInput {
             text: text.clone(),
             images: Vec::new(),
@@ -96,6 +113,7 @@ impl SessionRuntime {
         self.history_ix = None;
         self.set_queued_status();
         cx.notify();
+        true
     }
 
     /// 卡片垃圾桶：移除该条（丢弃）。
@@ -115,44 +133,100 @@ impl SessionRuntime {
         }
     }
 
-    /// 卡片「立即」（ZCode sendQueuedNow parity）：把该条从队列取出，以
-    /// `prompt + streamingBehavior:"steer"` 插进当前轮（pi 原子判定——空闲
-    /// 则直接开跑）。乐观上屏与 steer_input 同口径。
+    /// 「立即/插话」的打断投递（2026-10-20 二次验收定批：**立即必须打断**）：
+    /// - 运行中：乐观上屏 → abort 当前回复（半截截断）+ clear_queue 撤 pi
+    ///   残留 → 条目进打断槽；本轮 aborted 的 AgentSettled 一到，flush 立即
+    ///   以新 prompt 发出——模型上下文 = 截断的上文 + 这条，马上看到。
+    ///   （此前走 pi steer 通道等「下一次模型调用前」的注入点，纯文本长
+    ///   生成没有调用边界——真机 54s 故事讲完才被回应，用户否掉。）
+    /// - 空闲：条目进打断槽，flush 直接开跑。
+    ///
+    /// 钉顶只看「有没有真的在打断」：agent 没在说话就无所谓插话——空闲
+    /// 投递 = **普通发送**，照常发言钉顶（steer 档 Enter / 空闲点立即都算），
+    /// 否则 steer 档的正常说话永远没有置顶（2026-10-20 验收回归，用户点名
+    /// 「agent 不在说话我怎么算是插话」）。运行中才不钉顶：消息跟在流后面
+    /// 不刷屏（用户定稿），`pin=false` 记进 pending_echo，回显按同一决定
+    /// 不翻页——只改上屏半边、回显又钉回去，「立即刷屏」照样发生（三次
+    /// 验收根因，events.rs 尾部同款注释）。
+    ///
+    /// 打断只退役**跟尾期**的锚点：钉顶期（内容还短于一屏）保留锚点，插话
+    /// 气泡只是追加在当前屏内内容之后，几何原地不动——退役会把短内容拽到
+    /// 屏底（用户报障：首条钉顶、思考中插话，消息全落到屏幕下半部分）。
+    ///
+    /// 槽不渲染卡片：乐观气泡即呈现。
+    pub(crate) fn interrupt_deliver(&mut self, entry: QueuedInput, cx: &mut Context<Self>) {
+        // 打断先行：先 abort 当前回复（半截截断）——旧输出流的 delta 立刻断流
+        if self.agent_running {
+            if let Some(session) = &self.agent.session {
+                let _ = session.send(&Command::Abort);
+                // pi 队列残留一并撤下（撤回的已上屏条目由 response 臂保泡
+                // 丢弃，见 clear_queue response 分流）
+                let _ = session.send(&Command::ClearQueue);
+            }
+            self.stream_started = None;
+            // 管道里还有 abort 前的旧流残包：标记切断，让它们并入旧 assistant
+            // 而不是在下面的乐观气泡之后再长出一条 assistant（气泡跳到旧输
+            // 出上方的根因，见 stream_cut 字段注释）
+            self.stream_cut = true;
+        }
+        let pin = !self.agent_running;
+        if !pin {
+            // 打断在跑的轮次：不翻页、消息追加在流尾部。锚点**只在跟尾期**退役
+            // （垫片已归零、卸掉不跳，且轮末内容缩水时不会被拽回上一轮的钉顶
+            // 位）；钉顶期保留锚点——内容还短于一屏，摘掉垫片 Bottom 胶水会把
+            // 整块内容拽到屏底（用户报障：首条消息已钉顶、思考中插话，所有
+            // 消息落到屏幕下半部分）。详见 ChatList::release_if_following。
+            self.pager.release_if_following();
+        }
+        if !entry.text.is_empty() && !entry.text.starts_with("/skill:") {
+            self.optimistic_send(entry.text.clone(), pin, cx);
+        }
+        if self.agent_running {
+            // 等待行保持（optimistic_send 已置位）：abort 收尾后新轮无缝衔接
+            if self.interrupt_pending.is_some() {
+                // 上一次打断还在途（settled 未到）：不覆盖槽，排到队首紧随其后
+                self.queued_inputs.insert(0, entry);
+            } else {
+                self.interrupt_pending = Some(entry);
+            }
+        } else {
+            self.interrupt_pending = Some(entry);
+            self.flush_local_queue(cx);
+        }
+        self.set_queued_status();
+        cx.notify();
+    }
+
+    /// composer 的打断入口（插话模式 Enter / queue 模式 Ctrl+Enter）：
+    /// 草稿 → 条目 → 进 ↑ 历史 → 清输入/附件 → [`interrupt_deliver`]。
+    pub(crate) fn interrupt_from_composer(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.trim().to_string();
+        if text.is_empty() && self.pending_images.is_empty() {
+            return;
+        }
+        let images = std::mem::take(&mut self.pending_images);
+        let entry = QueuedInput {
+            text: text.clone(),
+            images,
+            remote: false,
+        };
+        if !text.is_empty() && self.history.last().map(|h| h != &text).unwrap_or(true) {
+            self.remember_input(text.clone());
+        }
+        self.history_ix = None;
+        self.input.clear();
+        self.interrupt_deliver(entry, cx);
+    }
+
+    /// 卡片「立即」（ZCode sendNow 对应物，打断语义）：该条出队 →
+    /// [`interrupt_deliver`]。运行中打断当前回复、本条最先发出，其余队列
+    /// 条目按原顺序紧随；空闲直接开跑。
     pub(crate) fn queue_send_now(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix >= self.queued_inputs.len() || self.flush_in_flight.is_some() {
             return;
         }
         let entry = self.queued_inputs.remove(ix);
-        let images = images_to_wire(&entry.images);
-        match self.agent.session.as_ref().map(|s| {
-            s.send(&Command::Prompt {
-                message: entry.text.clone(),
-                images,
-                streaming_behavior: Some("steer".into()),
-            })
-        }) {
-            Some(Ok(_)) => {
-                self.status = tr("status.steered").into();
-                // 技能命令不做乐观回显（pi-web parity，同 steer_input）
-                if !entry.text.is_empty() && !entry.text.starts_with("/skill:") {
-                    self.optimistic_send(entry.text, cx);
-                } else {
-                    cx.notify();
-                }
-            }
-            Some(Err(e)) => {
-                // 发送失败：条目放回原位，不静默丢
-                self.queued_inputs.insert(ix.min(self.queued_inputs.len()), entry);
-                self.status = e;
-                cx.notify();
-            }
-            None => {
-                // 无进程：放回原位（下次 settled / 下次发送兜底）
-                self.queued_inputs.insert(ix.min(self.queued_inputs.len()), entry);
-                self.status = tr("status.disconnected").into();
-                cx.notify();
-            }
-        }
+        self.interrupt_deliver(entry, cx);
     }
 
     /// 卡片铅笔（ZCode 撤回编辑 parity，**不是原地改**）：composer 有草稿
@@ -210,40 +284,68 @@ impl SessionRuntime {
         (joined, images)
     }
 
-    /// flush 本地队列：仅在空闲（!agent_running）且非压缩时发队首。
-    /// 调用点：AgentSettled 臂 / compact response / 入队瞬间（空闲发送立即
-    /// 开跑）。发 `Prompt{streaming_behavior: None}`：pi 空闲直接开跑；
-    /// 万一实际在跑（AgentEnd..Settled 续跑窗的猜测误差）pi 会**拒绝**而
-    /// 非静默入队——response 臂放回队首等下一次 settled，护栏闭环。
+    /// flush：打断槽优先，其次本地队列队首。仅在空闲（!agent_running）且
+    /// 非压缩时发。调用点：AgentSettled 臂 / compact response / 入队与打断
+    /// 瞬间（空闲即开跑）。发 `Prompt{streaming_behavior: None}`：pi 空闲
+    /// 直接开跑；万一实际在跑（AgentEnd..Settled 续跑窗的猜测误差）pi 会
+    /// **拒绝**而非静默入队——response 臂放回等下一次 settled，护栏闭环。
     pub(crate) fn flush_local_queue(&mut self, cx: &mut Context<Self>) {
-        if self.flush_in_flight.is_some()
-            || self.compacting
-            || self.agent_running
-            || self.queued_inputs.is_empty()
-        {
+        if self.flush_in_flight.is_some() || self.compacting || self.agent_running {
             return;
         }
-        // 队首 → wire 命令（owned，先于 session 借用构建）
-        let entry = &self.queued_inputs[0];
-        let cmd = Command::Prompt {
-            message: entry.text.clone(),
-            images: images_to_wire(&entry.images),
-            streaming_behavior: None,
+        // 打断槽优先（owned），否则取队列队首（留在队列里，由 response 摘）
+        let (cmd, interrupt_entry) = if let Some(entry) = self.interrupt_pending.take() {
+            (
+                Command::Prompt {
+                    message: entry.text.clone(),
+                    images: images_to_wire(&entry.images),
+                    streaming_behavior: None,
+                },
+                Some(entry),
+            )
+        } else if !self.queued_inputs.is_empty() {
+            let entry = &self.queued_inputs[0];
+            (
+                Command::Prompt {
+                    message: entry.text.clone(),
+                    images: images_to_wire(&entry.images),
+                    streaming_behavior: None,
+                },
+                None,
+            )
+        } else {
+            return;
         };
         // 040/043 承诺：消息被扣住期间 send_input 的空闲重绑分支不会跑，
-        // flush 补上同一承诺（扩展清单/MCP 重绑）。失败（spawn 失败）留队。
+        // flush 补上同一承诺（扩展清单/MCP 重绑）。失败（spawn 失败）留队/留槽。
         if !self.rebind_pending(cx) {
+            if let Some(entry) = interrupt_entry {
+                self.interrupt_pending = Some(entry);
+            }
             return;
         }
         let Some(session) = &self.agent.session else {
-            return; // 无进程：留着，spawn 后的下一次 settled / 发送兜底
+            // 无进程：打断条目放回槽，队列留队——spawn 后的下一次 settled /
+            // 发送兜底
+            if let Some(entry) = interrupt_entry {
+                self.interrupt_pending = Some(entry);
+            }
+            return;
         };
         match session.send(&cmd) {
             Ok(id) => {
-                self.flush_in_flight = Some(id);
+                self.flush_in_flight = Some(FlushInFlight {
+                    id,
+                    interrupt: interrupt_entry,
+                });
                 self.status = "running".into();
             }
-            Err(e) => self.status = e,
+            Err(e) => {
+                if let Some(entry) = interrupt_entry {
+                    self.interrupt_pending = Some(entry);
+                }
+                self.status = e;
+            }
         }
         cx.notify();
     }

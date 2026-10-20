@@ -203,6 +203,8 @@ impl SessionRuntime {
         self.pager.release();
         self.messages.clear();
         self.pending_echoes.clear();
+        // 分支后的 RPC 快照即权威：旧轮的切断窗口作废
+        self.stream_cut = false;
         self.phase_waiting = false;
         self.streaming_content = false;
         self.agent_running = false;

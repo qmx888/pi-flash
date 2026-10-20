@@ -26,6 +26,11 @@ const REFRESH_AFTER_SECS: i64 = 3600;
 impl Chat {
     /// 揭幕后延迟加载钩子（startup.rs 调用一次）。
     pub(crate) fn spawn_pi_ext_market_prefetch(&mut self, cx: &mut gpui::Context<Self>) {
+        // 入口关闭（dev-flags `pi_ext_market`，默认关）→ 连后台预热也不跑：
+        // 没人能看到市场页，就别为用户偷跑网络。
+        if !crate::services::workspace::pi_ext_market_enabled() {
+            return;
+        }
         // 页面已装载/打开 → 让它自己的刷新链路负责，别抢
         if self.aux.market.pi_ext.loaded_once || self.aux.market.pi_ext.loading {
             return;

@@ -77,9 +77,28 @@ impl SessionRuntime {
         }
     }
 
+    /// 思考档对账：pi 的 `thinkingLevel` 是唯一真值（请求档会被模型能力
+    /// 截断——deepseek-flash 只有 off/low/high/max，请求 `minimal` 实际是
+    /// `low`）。override 只在不是 auto（None）时归一过来：它要跟 pi 同档，
+    /// 否则菜单打勾与胶囊各说各话，respawn 的 `--thinking` 还会带着一个 pi
+    /// 根本不支持的档。
+    fn reconcile_thinking_override(&mut self) {
+        let Some(real) = self.state.as_ref().and_then(|s| s.thinking_level.clone()) else {
+            return;
+        };
+        if self
+            .thinking_override
+            .as_deref()
+            .is_some_and(|ov| ov != real)
+        {
+            self.thinking_override = Some(real);
+        }
+    }
+
     pub(super) fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
-        // MessageStart(user) 置位翻页锚点（见函数尾 page_turn）
-        let mut user_arrived = false;
+        // 用户消息到达携带发送帧的钉顶决定（None = 未到；Some(pin) = 到了，
+        // 见函数尾 page_turn）
+        let mut user_arrived: Option<bool> = None;
         match event {
             Event::Response {
                 id,
@@ -89,22 +108,35 @@ impl SessionRuntime {
                 data,
                 ..
             } => {
-                if command == "prompt" && self.flush_in_flight.as_deref() == Some(id.as_str()) {
-                    // 090 flush 关联（queue.rs flush_local_queue）：队首消息以
-                    // Prompt{None} 发出后的回执。success = pi 接受并开跑，摘掉
-                    // 队首（回显经 message_start 正常入流，本地队列不做乐观
-                    // 气泡，无去重负担）；failure = pi 实际在忙（AgentEnd..
-                    // Settled 续跑窗的猜测误差）**响亮拒绝**——放回队首等下一
-                    // 次 settled 重试，不静默丢、更不会插进当前轮。
-                    self.flush_in_flight = None;
+                if command == "prompt" && self.flush_in_flight.as_ref().is_some_and(|f| f.id == id)
+                {
+                    // 090 flush 关联（queue.rs flush_local_queue）：队首/打断槽
+                    // 消息以 Prompt{None} 发出后的回执。success = pi 接受并开跑
+                    // （普通队列 flush 摘掉队首——回显经 message_start 正常入
+                    // 流；打断槽条目已出槽，无动作）；failure = pi 实际在忙
+                    // （AgentEnd..Settled 续跑窗的猜测误差）**响亮拒绝**——
+                    // 队首仍在队列、打断条目放回槽，等下一次 settled 重试，
+                    // 不静默丢、更不会插进当前轮。
+                    let in_flight = self.flush_in_flight.take();
                     if success {
-                        if !self.queued_inputs.is_empty() {
+                        let from_interrupt = in_flight.is_some_and(|f| f.interrupt.is_some());
+                        if !from_interrupt && !self.queued_inputs.is_empty() {
                             self.queued_inputs.remove(0);
                         }
                     } else {
+                        if let Some(entry) = in_flight.and_then(|f| f.interrupt) {
+                            self.interrupt_pending = Some(entry);
+                        }
                         self.status = tr("queue.pushed_back").into();
                     }
                     cx.notify();
+                } else if command == "set_thinking_level" && success {
+                    // 请求档可能被 pi 按模型能力**截断**，而 pi 只在真变了才
+                    // 广播 thinking_level_changed（请求 minimal 落在当前档时
+                    // 一声不响）——回执补一次 get_state 把 override 归一到
+                    // 真值，菜单打勾才与 pi 同档（否则 override 会留着一个
+                    // pi 根本不支持的档，respawn 的 --thinking 也带着它）。
+                    self.rpc(&Command::GetState);
                 } else if command == "get_state" && success {
                     if let Some(data) = &data {
                         let st = SessionState::parse(data);
@@ -112,6 +144,9 @@ impl SessionRuntime {
                         // fork / clone 换分支）→ shell 身份必须跟着换
                         let rebound = st.session_file.clone().map(PathBuf::from);
                         self.state = Some(st);
+                        // 换模型/轮末/思考档回执都会走到这里：状态槽是
+                        // 标签真值源，override 相形之下只是草稿意图
+                        self.reconcile_thinking_override();
                         if let Some(f) = rebound {
                             self.follow_session_file(f, cx);
                         }
@@ -277,9 +312,14 @@ impl SessionRuntime {
                 } else if command == "clear_queue" && success {
                     // abort 的配对撤回（根因见 abort_stream 注释）：response
                     // data 携带被撤下的未投递原文 {steering:[..], followUp:[..]}。
-                    // 逐条：摘 pending_echoes（不会再回显）→ 删乐观气泡（同文
-                    // 匹配口径与回显臂一致；/skill: 等未乐观上屏的自然无泡可删）
-                    // → 文本回填输入框（pi-web restoring-to-editor parity）。
+                    // 分流（2026-10-20 验收修订）：
+                    // - **已乐观上屏的**（pending_echoes 命中）= 用户视角
+                    //   「已发送」——气泡**保留**、文本不回编辑器（回输入框
+                    //   会把发出去的话原样弹回，真机验收否掉；转排队卡同理）。
+                    //   它确实没进模型上下文，快照重读后气泡自然消失；↑ 历史
+                    //   里仍有原文可捞回。
+                    // - 从未上屏的（090 后只剩 pif-ui 自动化残留）：删乐观
+                    //   气泡兜底 + 文本回填输入框（14e6059 语义）。
                     let d = data.unwrap_or(serde_json::Value::Null);
                     let mut recalled: Vec<String> = Vec::new();
                     for key in ["followUp", "steering"] {
@@ -294,30 +334,49 @@ impl SessionRuntime {
                         }
                     }
                     if !recalled.is_empty() {
+                        let mut dropped = 0usize;
+                        let mut editor_recalled: Vec<String> = Vec::new();
                         for text in &recalled {
-                            if let Some(ix) = self.pending_echoes.iter().position(|p| p == text) {
+                            if let Some(ix) =
+                                self.pending_echoes.iter().position(|p| p.text == *text)
+                            {
+                                // 已上屏：摘 pending_echoes（不会再回显），气泡留
                                 self.pending_echoes.remove(ix);
-                            }
-                            if let Some(ix) = self.messages.iter().rposition(|m| {
-                                m.role == Role::User
-                                    && m.text_len() == text.len()
-                                    && m.plain_text().as_ref() == text
-                            }) {
-                                self.messages.remove(ix);
+                                dropped += 1;
+                            } else {
+                                // 未上屏：删乐观气泡兜底（同文匹配口径与回显臂
+                                // 一致）+ 回编辑器
+                                if let Some(ix) = self.messages.iter().rposition(|m| {
+                                    m.role == Role::User
+                                        && m.text_len() == text.len()
+                                        && m.plain_text().as_ref() == text
+                                }) {
+                                    self.messages.remove(ix);
+                                }
+                                editor_recalled.push(text.clone());
                             }
                         }
-                        // 锚点可能指着被删的气泡：按「重读后」口径重锚
-                        self.restore_anchor_after_reload();
-                        self.status = crate::i18n::tf(
-                            "status.recalled_queued",
-                            &[("count", recalled.len().to_string())],
-                        );
-                        // pi 侧撤回的条目不带附件（附件随消息入队即消费），
-                        // images 恒空；本地队列的撤回（090 abort）才有附件
-                        cx.emit(SessionEvent::RecallInput {
-                            text: recalled.join("\n\n"),
-                            images: Vec::new(),
-                        });
+                        if !editor_recalled.is_empty() {
+                            // 锚点可能指着被删的气泡：按「重读后」口径重锚
+                            self.restore_anchor_after_reload();
+                            self.status = crate::i18n::tf(
+                                "status.recalled_queued",
+                                &[("count", editor_recalled.len().to_string())],
+                            );
+                            // pi 侧撤回的条目不带附件（附件随消息入队即消费），
+                            // images 恒空；本地队列的撤回（090 abort）才有附件
+                            cx.emit(SessionEvent::RecallInput {
+                                text: editor_recalled.join("\n\n"),
+                                images: Vec::new(),
+                            });
+                        }
+                        if dropped > 0 {
+                            self.status = crate::i18n::tf(
+                                "status.steer_dropped",
+                                &[("count", dropped.to_string())],
+                            );
+                            cx.notify();
+                        }
                     }
                 } else if success {
                     self.status = format!("{command} ok");
@@ -398,8 +457,14 @@ impl SessionRuntime {
                         // 不命中则照常 push（pi 侧自行产生的 user 消息）。
                         // 回显到达 ≠ agent 已开始应答，等待行（spark + 正在思考…
                         // + shimmer）必须活到第一个 assistant 事件
-                        if let Some(ix) = self.pending_echoes.iter().position(|p| *p == echo_text) {
-                            self.pending_echoes.remove(ix);
+                        if let Some(ix) =
+                            self.pending_echoes.iter().position(|p| p.text == echo_text)
+                        {
+                            // 发送帧的钉顶决定随条目走（PendingEcho.pin）：打断
+                            // 投递（立即/Ctrl+Enter）上屏时不钉顶，回显升级同样
+                            // 不许翻页——回显再补一次 page_turn 就是「立即刷屏」
+                            // 的根因（2026-10-20 三次验收）
+                            let echo_pin = self.pending_echoes.remove(ix).pin;
                             // 保障幅度：死信条目（拒绝误判 / 会话切换等）永不回显时只会占位，
                             // 不能无限堆。轮终不清（见上），这里补上限。
                             while self.pending_echoes.len() > 64 {
@@ -415,6 +480,7 @@ impl SessionRuntime {
                                 let m = &mut self.messages[ix];
                                 m.blocks = blocks;
                             }
+                            user_arrived = Some(echo_pin);
                         } else {
                             self.messages.push(Msg {
                                 role: Role::User,
@@ -431,11 +497,16 @@ impl SessionRuntime {
                                 details: None,
                                 model: None,
                             });
+                            // pi 侧自行产生的 user 消息（分支/压缩重放等）：无
+                            // 发送帧可言，沿用原行为钉顶
+                            user_arrived = Some(true);
                         }
-                        user_arrived = true;
                     }
                     "assistant" => {
                         self.phase_waiting = false;
+                        // 新轮 assistant 消息 = 合法新流开始：此后的 delta 属于
+                        // 它本身，切断标记使命结束（残包窗口只覆盖 abort..settle）
+                        self.stream_cut = false;
                         // 不清 pending_echoes：排队发送的回显在**下一轮 turn 边界**
                         // 才到，中间会先流过本轮的一堆 assistant 事件；这里
                         // 清了就是“排队气泡回显时又被当成新消息推了一条”
@@ -756,6 +827,9 @@ impl SessionRuntime {
                 self.agent_running = false;
                 self.phase_waiting = false;
                 self.streaming_content = false;
+                // 轮次彻底结束：残包窗口（abort..settle）关闭的兜底清除——
+                // 之后到达的流事件都属新轮，不得再并入旧 assistant
+                self.stream_cut = false;
                 // 一轮结束**不**退役锚点：pi-web 只是 promptAnchorActive=false
                 // 让垫片收敛，容器 scrollTop 保持——短回复留在屏顶、长回复由
                 // 胶水跟随尾部。锚点在此退役会把内容拽回屏底（消息从屏顶跳走，
@@ -901,6 +975,16 @@ impl SessionRuntime {
                 self.exit_code = code;
             }
             Event::WireEvent { .. } => {}
+            // 思考档真值（pi 按模型能力截断后广播）：状态槽是胶囊标签的
+            // 首选来源，不跟着它走就永远停在 get_state 那一刻的旧值——真机
+            // 症状「怎么换都是 high」（pi 早已是 low/minimal，标签不动）。
+            Event::ThinkingLevelChanged { level } => {
+                if let Some(st) = self.state.as_mut() {
+                    st.thinking_level = Some(level.clone());
+                }
+                self.reconcile_thinking_override();
+                cx.notify();
+            }
             // pi 队列全量快照（入队/投递/清空都发）：镜像供「已排队 N 条」
             // 状态行；投递回显时 pi 已同步摘除队列项，镜像自动跟真
             Event::QueueUpdate {
@@ -939,9 +1023,12 @@ impl SessionRuntime {
                 }
             }
         }
-        // 用户消息到达（发送回显升级 / steer 推入）→ 翻页：该消息钉视口
-        // 顶，历史滚出屏（回显升级同锚点重入不重钉，见 page_turn）
-        if user_arrived {
+        // 用户消息到达 → 按**发送帧**的钉顶决定翻页：空闲普通发送钉视口
+        // 顶，历史滚出屏（回显升级同锚点重入不重钉，见 page_turn）；打断
+        // 投递（立即/Ctrl+Enter）发送帧不钉（queue.rs interrupt_deliver），
+        // 回显到达同样不钉——否则乐观上屏的「不刷屏」在这里被补一刀，立
+        // 即消息照旧把整屏顶出去（2026-10-20 三次验收）
+        if user_arrived == Some(true) {
             let ix = self.messages.len() - 1;
             self.pager
                 .page_turn(ix, self.messages.len(), self.phase_row_visible());
@@ -1027,6 +1114,8 @@ impl SessionRuntime {
     ) {
         self.messages.clear();
         self.pending_echoes.clear();
+        // 整表已按权威快照归一：切断窗口随之作废（残包即使再到也不能并入）
+        self.stream_cut = false;
         for msg in &rpc_msgs {
             let blocks = content_blocks(&msg["content"]);
             let usage = Usage::parse(&msg["usage"]);

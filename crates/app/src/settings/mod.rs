@@ -663,9 +663,6 @@ fn nav_items(tab: u8, weak_close: gpui::WeakEntity<Chat>) -> Vec<gpui::AnyElemen
     if !crate::services::workspace::subagents_enabled() {
         items.retain(|(ix, _, _)| *ix != TAB_AGENTS);
     }
-    // 040-1：扩展管理已迁到「Pi扩展市场」标准页，设置里的扩展页**隐藏不删**
-    // （渲染分支与全部状态/CLI op 管道保留，市场页直接复用；重开 = 删掉本行）
-    items.retain(|(ix, _, _)| *ix != TAB_PLUGINS);
     items
         .iter()
         .map(|(ix, label, icon_name)| {

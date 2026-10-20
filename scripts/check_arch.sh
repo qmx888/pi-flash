@@ -114,7 +114,16 @@ else
 fi
 
 echo
-echo "== 4. build 无新警告 / test 全绿 =="
+echo "== 4. 页面禁手搓控件（交互链里的裸几何字面量；存量走 scripts/ui-raw-baseline.txt）=="
+if python scripts/check_ui_raw.py; then
+  :
+else
+  echo "VIOLATION: 新增手搓控件（改用 crate::ui::kit::* / ui::tokens；特殊件写 ui-raw: ok 并在 §10 登记）"
+  fail=1
+fi
+
+echo
+echo "== 5. build 无新警告 / test 全绿 =="
 # 构建失败也要红（不能只数 warning：error 行不匹配 ^warning，曾把编译
 # 损坏静默成 "app warnings: 0" + "tests ok"，0.1.10 发版被 release 构建
 # 拦下才发现）

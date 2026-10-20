@@ -1091,6 +1091,13 @@ pub fn subagents_enabled() -> bool {
     dev_flag_enabled("subagents")
 }
 
+/// 040-1 Pi 扩展市场入口开关（开发旗标，**默认关 = 发版不可见**）。
+/// 关态 = topbar 「菜单」三横钮不渲染、`open_pi_ext_market` 直接返回，
+/// 任何入口（菜单/自动化）都摸不到市场页。
+pub fn pi_ext_market_enabled() -> bool {
+    dev_flag_enabled("pi_ext_market")
+}
+
 /// 文件树 git 标识开关（设置-界面；默认关 = 清爽目录树，023 定案）。
 pub fn git_markers() -> bool {
     app_settings().git_markers.unwrap_or(false)

@@ -4,6 +4,8 @@
 pub mod button;
 pub mod composer_input;
 pub mod dropdown;
+/// 页面级组件库（页面只从这里取控件；见 kit/mod.rs 头注释）
+pub(crate) mod kit;
 pub mod list_handle;
 pub mod overlay;
 pub mod popup;

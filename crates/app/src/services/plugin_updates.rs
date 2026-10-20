@@ -74,15 +74,13 @@ pub(crate) struct PkgUpdateResult {
     pub(crate) source: String,
     pub(crate) display_name: String,
     pub(crate) state: PkgUpdateState,
-    pub(crate) message: Option<String>,
 }
 
-fn mk(source: &str, state: PkgUpdateState, message: Option<String>) -> PkgUpdateResult {
+fn mk(source: &str, state: PkgUpdateState) -> PkgUpdateResult {
     PkgUpdateResult {
         source: source.to_string(),
         display_name: pi_link::skills::display_source(source).to_string(),
         state,
-        message,
     }
 }
 
@@ -105,7 +103,7 @@ pub(crate) fn check_all() -> Vec<PkgUpdateResult> {
     if offline() {
         return sources
             .iter()
-            .map(|s| mk(s, PkgUpdateState::Error, Some("PI_OFFLINE=1".to_string())))
+            .map(|s| mk(s, PkgUpdateState::Error))
             .collect();
     }
     let agent_dir = pi_link::config::agent_dir();
@@ -126,35 +124,35 @@ fn check_one(agent_dir: &Path, source: &str) -> PkgUpdateResult {
             .as_deref()
             .is_some_and(|v| semver::Version::parse(v).is_ok())
         {
-            return mk(source, PkgUpdateState::Unsupported, None);
+            return mk(source, PkgUpdateState::Unsupported);
         }
         return check_npm(agent_dir, source, npm);
     }
     if is_git_source(source) {
         if has_git_ref(source) {
-            return mk(source, PkgUpdateState::Unsupported, None);
+            return mk(source, PkgUpdateState::Unsupported);
         }
         return check_git(source);
     }
     // 本地路径等：原地目录，没有「更新」概念
-    mk(source, PkgUpdateState::Unsupported, None)
+    mk(source, PkgUpdateState::Unsupported)
 }
 
 fn check_npm(agent_dir: &Path, source: &str, npm: NpmSource) -> PkgUpdateResult {
     let installed = pi_link::skills::package_install_dir_in(agent_dir, source);
     let current = match read_installed_version(&installed) {
         Ok(v) => v,
-        Err(e) => return mk(source, PkgUpdateState::Error, Some(e)),
+        Err(_) => return mk(source, PkgUpdateState::Error),
     };
     // npm view 以主目录为 cwd（用户 .npmrc 的 registry 生效；与项目无关）
     let mut cmd = match npm_invocation(&["view", &npm.spec, "version", "--json"]) {
         Ok(c) => c,
-        Err(e) => return mk(source, PkgUpdateState::Error, Some(e)),
+        Err(_) => return mk(source, PkgUpdateState::Error),
     };
     cmd.current_dir(home_dir());
     let out = match run_timeout(cmd, CMD_TIMEOUT) {
         Ok(o) => o,
-        Err(e) => return mk(source, PkgUpdateState::Error, Some(e)),
+        Err(_) => return mk(source, PkgUpdateState::Error),
     };
     let range = npm
         .version
@@ -167,20 +165,16 @@ fn check_npm(agent_dir: &Path, source: &str, npm: NpmSource) -> PkgUpdateResult 
             } else {
                 PkgUpdateState::UpToDate
             };
-            mk(source, state, None)
+            mk(source, state)
         }
-        Err(e) => mk(source, PkgUpdateState::Error, Some(e)),
+        Err(_) => mk(source, PkgUpdateState::Error),
     }
 }
 
 fn check_git(source: &str) -> PkgUpdateResult {
     let dir = pi_link::skills::package_install_dir(source);
     if !dir.is_dir() {
-        return mk(
-            source,
-            PkgUpdateState::Error,
-            Some("not installed".to_string()),
-        );
+        return mk(source, PkgUpdateState::Error);
     }
     let git = |args: &[&str]| {
         let mut cmd = Command::new("git");
@@ -192,7 +186,7 @@ fn check_git(source: &str) -> PkgUpdateResult {
     // 本地 HEAD vs 上游：先解析 @{upstream}，解析不到退 HEAD（pi-web 同款）
     let local = match git(&["rev-parse", "HEAD"]) {
         Ok(o) => o.trim().to_string(),
-        Err(e) => return mk(source, PkgUpdateState::Error, Some(e)),
+        Err(_) => return mk(source, PkgUpdateState::Error),
     };
     let upstream = git(&["rev-parse", "--abbrev-ref", "@{upstream}"])
         .map(|o| o.trim().to_string())
@@ -203,7 +197,7 @@ fn check_git(source: &str) -> PkgUpdateResult {
     };
     let remote = match git(&["ls-remote", "origin", &head]) {
         Ok(o) => o,
-        Err(e) => return mk(source, PkgUpdateState::Error, Some(e)),
+        Err(_) => return mk(source, PkgUpdateState::Error),
     };
     match first_commit_hash(&remote) {
         Some(hash) => {
@@ -212,13 +206,9 @@ fn check_git(source: &str) -> PkgUpdateResult {
             } else {
                 PkgUpdateState::UpdateAvailable
             };
-            mk(source, state, None)
+            mk(source, state)
         }
-        None => mk(
-            source,
-            PkgUpdateState::Error,
-            Some(format!("failed to determine remote {head}")),
-        ),
+        None => mk(source, PkgUpdateState::Error),
     }
 }
 
