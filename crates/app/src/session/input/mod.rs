@@ -242,6 +242,21 @@ impl Chat {
         out.extend(self.pool.globals.commands.iter().cloned());
         std::borrow::Cow::Owned(out)
     }
+
+    /// `skill:<name>` 命令对应的技能层级目录（`engineering/tdd` 的
+    /// `engineering`）。pi 的 `get_commands` 只给名字与描述，层级得自己按技能
+    /// 表反查：`/` 菜单靠它把分类画成暗色前缀（与 @ 菜单的目录前缀同款）。
+    pub(crate) fn skill_category(&self, command: &str) -> String {
+        let Some(name) = command.strip_prefix("skill:") else {
+            return String::new();
+        };
+        let ctx = self.pool.project_ctx.get(&self.project_key());
+        // 项目技能优先，没命中再看设置页那份现读的技能表（全局技能也在里面）
+        ctx.and_then(|c| c.skills.iter().find(|s| s.name == name))
+            .or_else(|| self.cfg.mc_skills.iter().find(|s| s.name == name))
+            .map(|s| s.category.clone())
+            .unwrap_or_default()
+    }
 }
 
 // ---- @ 文件索引状态类型（自 shell/types.rs 下沉，composer 域自持）----

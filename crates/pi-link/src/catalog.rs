@@ -275,6 +275,7 @@ mod tests {
             path: PathBuf::from("x/SKILL.md"),
             scope: crate::skills::SkillScope::Global,
             disable_invocation: false,
+            category: String::new(),
         };
         let cs = skill_commands(&[s("image-gen"), s("image-gen"), s("jev")]);
         assert_eq!(cs.len(), 2);

@@ -690,6 +690,7 @@ fn settings_surface(chat: &Chat, cx: &Context<Chat>) -> Value {
                             "scope": format!("{:?}", s.scope),
                             "disabled": s.disable_invocation,
                             "path": s.path.to_string_lossy(),
+                            "category": s.category,
                         })
                     })
                     .collect::<Vec<_>>(),

@@ -57,6 +57,8 @@ impl Chat {
                         insert: c.name.clone(),
                         desc: c.description.clone(),
                         is_dir: false,
+                        // 层级前缀（skill 命令才有）：按技能表反查分类目录
+                        category: self.skill_category(&c.name),
                     })
                     .collect()
             }
@@ -97,6 +99,7 @@ impl Chat {
                         insert: e.path,
                         desc: String::new(),
                         is_dir: e.is_dir,
+                        category: String::new(),
                     })
                     .collect()
             }
@@ -173,11 +176,15 @@ pub(crate) fn slash_menu_view(
         let name = c.insert.clone();
         let desc = c.desc.replace('\n', " ");
         // @ 条目：目录前缀暗色 + 文件名亮色，目录尾随 `/`（pi-web 渲染 parity）
+        // `/` 条目：技能也有层级（`~/.agents/skills/engineering/tdd/`），把分类
+        // 目录当同样的暗色前缀画出来；非技能命令没有这一截。
         let (dir_part, name_part) = if is_at {
             match name.rfind('/') {
                 Some(ix) => (Some(name[..=ix].to_string()), name[ix + 1..].to_string()),
                 None => (None, name.clone()),
             }
+        } else if !c.category.is_empty() {
+            (Some(format!("{}/", c.category)), name.clone())
         } else {
             (None, name.clone())
         };

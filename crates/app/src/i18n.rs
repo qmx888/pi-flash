@@ -370,6 +370,7 @@ const TABLE: &[(&str, &str, &str, &str)] = &[
     ("file_tree.new_folder", "新建目录", "新增資料夾", "New folder"),
     ("action.rename", "重命名", "重新命名", "Rename"),
     ("field.name", "名称", "名稱", "Name"),
+    ("field.category", "分类目录", "分類目錄", "Category"),
     ("action.create", "创建", "建立", "Create"),
     ("tree.name_required", "名称不能为空", "名稱不能為空", "Name cannot be empty"),
     ("tree.name_has_separator", "名称不能包含路径分隔符", "名稱不能包含路徑分隔符", "Name cannot contain path separators"),

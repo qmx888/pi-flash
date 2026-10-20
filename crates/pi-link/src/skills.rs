@@ -23,11 +23,25 @@ pub struct SkillEntry {
     pub scope: SkillScope,
     /// `disable-model-invocation: true` — hidden from the model prompt
     pub disable_invocation: bool,
+    /// 相对技能根的上级目录链（`engineering/tdd` → `engineering`；直接挂在根下
+    /// 为空串）。pi 的技能目录本身支持分级，面板据此把层级画出来。
+    pub category: String,
 }
 
+/// 技能根下最多向下钻几层目录（用户定稿 4：`stock/tdx/SKILL.md` 是 2 层，
+/// `evolve/nuwa-skill/examples/x/SKILL.md` 是 4 层；再深的是技能内部素材，
+/// 不是技能）。
+const MAX_SKILL_DEPTH: usize = 4;
+
 /// Discover skills for a workspace. Order: project dirs, global dirs, then
-/// settings-declared paths; each dir contributes its immediate subdirs that
-/// contain a SKILL.md.
+/// settings-declared paths.
+///
+/// **层级语义对齐 pi**（`loadSkillsFromDirInternal`，vendor pi core/skills.js）：
+/// 目录里有 SKILL.md 就是技能根，**不再往里钻**（技能的 `examples/`、`scripts/`
+/// 里常带别人的 SKILL.md，钻进去会把素材当技能）；没有就递归子目录找，最深
+/// [`MAX_SKILL_DEPTH`] 层。隐蔽项（`.` 开头）与 `node_modules` 跳过。
+/// 旧实现只读直接子目录一层，`~/.agents/skills/engineering/tdd/` 这类分类
+/// 目录里的技能整批看不见（面板与 `/` 菜单同时缺货）。
 pub fn discover_skills(
     cwd: &Path,
     agent_dir: &Path,
@@ -48,26 +62,67 @@ pub fn discover_skills(
     let mut out: Vec<SkillEntry> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for (dir, scope) in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut subdirs: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        subdirs.sort();
-        for sub in subdirs {
-            let skill_md = sub.join("SKILL.md");
-            if !seen.insert(skill_md.clone()) || !skill_md.is_file() {
-                continue;
-            }
-            if let Some(entry) = parse_skill(&skill_md, scope) {
-                out.push(entry);
-            }
-        }
+        collect_skills(&dir, 0, "", scope, &mut seen, &mut out);
     }
     out
+}
+
+/// 递归收集一个目录下的技能。`depth` 是相对技能根的层数：根自己有 SKILL.md
+/// 就是一份技能（settings 里可以直接指向某个技能目录），否则逐层往下找。
+/// `rel` 是当前目录相对根的路径，落成 [`SkillEntry::category`]（面板画层级）。
+fn collect_skills(
+    dir: &Path,
+    depth: usize,
+    rel: &str,
+    scope: SkillScope,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    out: &mut Vec<SkillEntry>,
+) {
+    let own = dir.join("SKILL.md");
+    if own.is_file() {
+        if seen.insert(own.clone())
+            && let Some(mut entry) = parse_skill(&own, scope)
+        {
+            // rel 含技能自己那层目录（`engineering/tdd`），分类 = 上级链
+            // （`engineering`）；直接挂根下 / 根自身即技能的都没有分类
+            entry.category = rel
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+                .unwrap_or_default();
+            out.push(entry);
+        }
+        // 技能根：不再往里钻（examples/、scripts/ 里的 SKILL.md 属素材）
+        return;
+    }
+    if depth >= MAX_SKILL_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut subdirs: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            !name.starts_with('.') && name != "node_modules"
+        })
+        .filter_map(|e| {
+            let path = e.path();
+            // is_dir 顺着符号链接（`~/.agents/skills/jspace -> …` 这种外挂目录）
+            path.is_dir()
+                .then(|| (e.file_name().to_string_lossy().to_string(), path))
+        })
+        .collect();
+    subdirs.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, path) in subdirs {
+        let child_rel = if rel.is_empty() {
+            name
+        } else {
+            format!("{rel}/{name}")
+        };
+        collect_skills(&path, depth + 1, &child_rel, scope, seen, out);
+    }
 }
 
 fn resolve_setting_path(cwd: &Path, agent_dir: &Path, p: &str) -> PathBuf {
@@ -125,6 +180,9 @@ fn parse_skill(skill_md: &Path, scope: SkillScope) -> Option<SkillEntry> {
         path: skill_md.to_path_buf(),
         scope,
         disable_invocation,
+        // 层级由 collect_skills 按收集路径填；单文件解析（settings 指向 .md 的
+        // 情形）没有分类目录
+        category: String::new(),
     })
 }
 
@@ -444,6 +502,101 @@ mod tests {
         assert_eq!(skills[0].description, "");
     }
 
+    /// 层级：分类目录（`engineering/tdd/`）里的技能要能被找到；技能根下的
+    /// `examples/*/SKILL.md` 属素材，不能当技能（pi 同款：有 SKILL.md 即根，
+    /// 不再下钻）；超过 4 层不认；`.` 开头与 `node_modules` 跳过。
+    #[test]
+    fn discovers_nested_skills_up_to_four_levels_only() {
+        let base = std::env::temp_dir().join(format!("skills-nest-{}", std::process::id()));
+        let root = base.join("home-agents");
+        // 1 层：直接挂根下
+        write_skill(&root, "flat", Some("---\nname: flat\ndescription: F\n---"));
+        // 2 层：按分类目录分（面板里这就是最普通的一层）
+        write_skill(
+            &root.join("engineering"),
+            "tdd",
+            Some("---\nname: tdd\ndescription: T\n---"),
+        );
+        // 4 层：仍算技能（root/a/b/c/deep4，深度=4）
+        let deep = root.join("reverse").join("engineer").join("anything");
+        write_skill(&deep, "four", Some("---\nname: four\ndescription: D\n---"));
+        // 5 层：不认（root/saas/a/b/c/five）
+        write_skill(
+            &root.join("saas").join("a").join("b").join("c"),
+            "five",
+            Some("---\nname: five\ndescription: X\n---"),
+        );
+        // 技能根内部的 SKILL.md 属素材，不能当技能（根是 `nuwa`）
+        let nuwa = root.join("evolve").join("nuwa");
+        write_skill(
+            &nuwa.join("examples"),
+            "karpathy",
+            Some("---\nname: karpathy\ndescription: K\n---"),
+        );
+        std::fs::write(
+            nuwa.join("SKILL.md"),
+            "---\nname: nuwa\ndescription: N\n---\n",
+        )
+        .unwrap();
+        // 隐蔽 / node_modules 目录直接跳过
+        write_skill(
+            &root.join(".hidden"),
+            "hidden-skill",
+            Some("---\nname: hidden\ndescription: H\n---"),
+        );
+        write_skill(
+            &root.join("node_modules"),
+            "dep-skill",
+            Some("---\nname: dep\ndescription: P\n---"),
+        );
+
+        let settings = parse_lenient("{}").unwrap();
+        let skills = discover_skills(&base.join("proj"), &base.join("nope"), &root, &settings);
+        let mut names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["flat", "four", "nuwa", "tdd"]);
+        // 层级路径要带上：面板/菜单靠它画分类前缀
+        let category = |name: &str| {
+            skills
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.category.clone())
+                .unwrap()
+        };
+        assert_eq!(category("flat"), "");
+        assert_eq!(category("tdd"), "engineering");
+        assert_eq!(category("four"), "reverse/engineer/anything");
+        assert_eq!(category("nuwa"), "evolve");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// settings 里能直接指向某个技能目录（该目录自己带 SKILL.md）。
+    #[test]
+    fn settings_path_may_point_at_a_skill_dir() {
+        let base = std::env::temp_dir().join(format!("skills-set-{}", std::process::id()));
+        let skill = write_skill(
+            &base.join("extras"),
+            "solo",
+            Some("---\nname: solo\ndescription: S\n---"),
+        );
+        let settings = parse_lenient(&format!(
+            "{{\"skills\": [{}]}}",
+            serde_json::json!(skill.parent().unwrap().to_string_lossy())
+        ))
+        .unwrap();
+        let skills = discover_skills(
+            &base.join("proj"),
+            &base.join("nope"),
+            &base.join("home-agents"),
+            &settings,
+        );
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "solo");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn package_description_reads_installed_package_json() {
         let base = std::env::temp_dir().join(format!("pkgdesc-{}", std::process::id()));
@@ -606,6 +759,7 @@ mod tests {
             path: PathBuf::from("C:/x/.pi/skills/demo/SKILL.md"),
             scope: SkillScope::Project,
             disable_invocation: false,
+            category: String::new(),
         };
         assert_eq!(
             prompt_block(&sk),

@@ -45,12 +45,18 @@ impl Chat {
     }
 }
 
-/// 休眠（对模型隐藏）技能排后面。
+/// 休眠（对模型隐藏）技能排后面；同档内按层级路径、再按名字排，同一分类
+/// 目录下的技能自然拔堆（面板把分类画成行首暗色前缀）。
 fn order_by_dormancy<'a>(
     items: &'a [&'a pi_link::skills::SkillEntry],
 ) -> Vec<&'a &'a pi_link::skills::SkillEntry> {
     let mut out: Vec<&&pi_link::skills::SkillEntry> = items.iter().collect();
-    out.sort_by_key(|s| s.disable_invocation);
+    out.sort_by(|a, b| {
+        a.disable_invocation
+            .cmp(&b.disable_invocation)
+            .then_with(|| a.category.cmp(&b.category))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
     out
 }
 
@@ -106,6 +112,10 @@ pub(crate) fn mc_skills_view(
             let active = sk.path.to_string_lossy() == section;
             let weak_item = weak.clone();
             let path = sk.path.to_string_lossy().to_string();
+            // 层级：分类目录（`engineering/tdd` → `engineering`）画成行首暗色
+            // 前缀，与 `/` 菜单、@ 菜单的目录前缀同款。深度只靠前缀体现，
+            // 不再缩进（侧栏宽定死 400px，缩进会切掉技能名）。
+            let category = sk.category.clone();
             list = list.child(
                 widgets::sidebar_item(format!("skill-{}", sk.name), active)
                     // 行背景压平（040：列表无底色，选中态只靠加粗+深字色，hover 保留）
@@ -119,6 +129,20 @@ pub(crate) fn mc_skills_view(
                     } else {
                         t.accent
                     }))
+                    .when(!category.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .max_w(px(120.))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .font_family(crate::editor::markdown::MONO_FAMILY)
+                                .text_size(crate::appearance::ui_size(11.))
+                                .text_color(rgb(t.text_dim))
+                                .child(SharedString::from(format!("{category}/"))),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -207,6 +231,12 @@ pub(crate) fn mc_skills_view(
                         )),
                 )
                 .child(field(&tr("field.name"), mono_text(sk.name.clone(), false)))
+                .when(!sk.category.is_empty(), |d| {
+                    d.child(field(
+                        &tr("field.category"),
+                        mono_text(sk.category.clone(), false),
+                    ))
+                })
                 .child(field(
                     &tr("tool_defs.description"),
                     div()

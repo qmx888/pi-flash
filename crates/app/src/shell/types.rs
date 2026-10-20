@@ -182,6 +182,9 @@ pub(crate) struct MenuItem {
     pub(crate) desc: String,
     /// @ 菜单条目的目录形态（决定插入文本 `@dir/` 不闭合 + 图标）
     pub(crate) is_dir: bool,
+    /// 技能的层级路径（`engineering/tdd` → `engineering`；空 = 直接挂在技能根
+    /// 下）。菜单把它画成暗色前缀，与 @ 菜单的目录前缀同款。
+    pub(crate) category: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
