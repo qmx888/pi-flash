@@ -7,10 +7,18 @@ Pi-Flash 缩写 PF
 # Quick Start
 
 ```bash
-cd vendor/pi && npm ci && cd ../..              # 首次；node_modules 不入库
-cargo run -p app                                # 运行（bin: pi-flash）
-RUST_MIN_STACK=33554432 cargo test -p pi-link   # 协议/路径测试都在 pi-link
+cd vendor/pi && npm ci && cd ../..   # 首次；node_modules 不入库
+just                                 # 列出全部任务
+just dev                             # debug 运行
+just test                            # 全部测试（pi-link + app）
+just dmg                             # macOS 打包：DMG + ZIP（产物在 dist/）
+just clean                           # 清 target/ 与 dist/
 ```
+
+任务入口全在 `justfile`（macOS 需要 `--features gpui/macos-blade`，只装
+CommandLineTools 时 `xcrun metal` 不可用，`just` 各 recipe 已带上）。
+不开 just 时的等价命令：`cargo run -p app --features gpui/macos-blade`、
+`RUST_MIN_STACK=33554432 cargo test -p pi-link`（协议/路径测试都在 pi-link）。
 
 - 环境变量：`PI_FLASH_PI_BIN` 覆盖内置 pi；`PI_FLASH_THEME` 切主题（default/dark/rose）；`PI_FLASH_RPC_LOG` 开 RPC 线缆日志；**`PI_FLASH_DIR` 显式指定永远优先；未设时按构建档位取默认——debug/test（cargo run/cargo test）自动落 `./pi-flash-dev`，release 才落 `~/.pi-flash`**（2026-10-18 起 paths 层焊死，裸跑测试摸不到正式目录；dev home 已进 `.gitignore`）；**dev-flags（重型模块发版排除，2026-10-19 起）默认全关**：`<PF数据目录>/dev-flags.json`（支持 // 注释）按键控模块，false/缺省=关、改动重启生效；键住址 = pi-link `dev_flags::KNOWN`（现仅 `subagents`），env 覆盖 `PI_FLASH_<键大写>=1/0` 最高优先，启动 stderr 打 `[startup] dev-flags:` 状态行。子代理关 = 不加载扩展 + 隐藏设置页与面板按钮
 - UI 验证一律走 pif-ui 自动化链路，禁止抢真实屏幕
