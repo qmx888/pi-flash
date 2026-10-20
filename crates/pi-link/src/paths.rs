@@ -109,21 +109,40 @@ pub fn current_install_root() -> Option<PathBuf> {
     std::env::current_exe().ok().map(|e| app_install_root(&e))
 }
 
-/// 路径键规范化（与 `projects::path_key` 同口径：`/`→`\\`、去尾分隔符、
-/// 大小写折叠）。paths 在 projects 下游，不能反向引用，就地实现。
+/// 路径键规范化（与 `projects::path_key` 同口径，按平台分）：
+/// - Windows：`/`→`\`、去尾分隔符、大小写折叠；
+/// - macOS/Linux：原样保留 `/` 与大小写，只去尾分隔符（`/` 自身不动）。
+/// paths 在 projects 下游，不能反向引用，就地实现。
 fn path_key_norm(p: &Path) -> String {
-    let mut k = p.to_string_lossy().replace('/', "\\");
-    while k.ends_with('\\') {
-        k.pop();
+    #[cfg(windows)]
+    {
+        let mut k = p.to_string_lossy().replace('/', "\\");
+        while k.ends_with('\\') {
+            k.pop();
+        }
+        k.to_ascii_lowercase()
     }
-    k.to_ascii_lowercase()
+    #[cfg(not(windows))]
+    {
+        let mut k = p.to_string_lossy().into_owned();
+        while k.len() > 1 && k.ends_with('/') {
+            k.pop();
+        }
+        k
+    }
 }
+
+/// 子路径判定的分隔符（Windows `\`，POSIX `/`）。
+#[cfg(windows)]
+const PATH_SEP: &str = "\\";
+#[cfg(not(windows))]
+const PATH_SEP: &str = "/";
 
 /// `p` 是否等于 `install_root` 或在其之下（纯函数，测试显式注入根）。
 pub fn is_app_install_path_at(p: &Path, install_root: &Path) -> bool {
     let r = path_key_norm(install_root);
     let k = path_key_norm(p);
-    k == r || k.starts_with(&format!("{r}\\"))
+    k == r || k.starts_with(&format!("{r}{PATH_SEP}"))
 }
 
 /// `p` 是否落在当前进程的应用安装根内（含根本身）。载荷目录 / npm 包根是
@@ -339,6 +358,7 @@ mod tests {
 
     /// 安装根识别：npm 布局的跨载荷目录覆盖 + 用户项目误伤面检查。
     #[test]
+    #[cfg(windows)]
     fn install_root_covers_sibling_payload_dirs() {
         // npm 布局：<pkg>/payload-0.1.12/ → 根 = <pkg>；旧载荷目录
         // <pkg>/payload（交接继承 cwd 的场景）与包内其他文件一律命中
@@ -377,6 +397,50 @@ mod tests {
         assert_eq!(
             app_install_root(Path::new("D:/tools/pi-flash-v0.1.12/pi-flash.exe")),
             Path::new("D:/tools/pi-flash-v0.1.12")
+        );
+    }
+
+    /// POSIX 同款：路径键不再折 `/` 与大小写，前缀判定要按 `/` 走。
+    #[test]
+    #[cfg(not(windows))]
+    fn install_root_covers_sibling_payload_dirs() {
+        let pkg = Path::new("/opt/node/lib/node_modules/pi-flash");
+        let root = app_install_root(&pkg.join("payload-0.1.12").join("pi-flash"));
+        assert_eq!(root, pkg);
+        assert!(is_app_install_path_at(&pkg.join("payload"), &root));
+        assert!(is_app_install_path_at(
+            &pkg.join("payload").join("vendor").join("pi"),
+            &root
+        ));
+        assert!(is_app_install_path_at(
+            &pkg.join("bin").join("pi-flash.js"),
+            &root
+        ));
+        // 前缀字符串但不同目录（pi-flash-extra）不能误判
+        assert!(!is_app_install_path_at(
+            Path::new("/opt/node/lib/node_modules/pi-flash-extra"),
+            &root
+        ));
+        assert!(!is_app_install_path_at(Path::new("/opt/node"), &root));
+        // POSIX 大小写敏感：同层不同大小写的兄弟目录不是同一个目录
+        // （Windows 上这两串折成同一路径，所以该断言只在非 Windows 成立）
+        assert!(!is_app_install_path_at(
+            Path::new("/opt/node/lib/node_modules/PI-FLASH"),
+            &root
+        ));
+        // 尾分隔符折叠
+        assert!(is_app_install_path_at(Path::new(&format!("{}/payload/", pkg.display())), &root));
+
+        let root2 = app_install_root(Path::new("/work/payload-demo/pi-flash"));
+        assert_eq!(root2, Path::new("/work/payload-demo"));
+        assert!(is_app_install_path_at(
+            Path::new("/work/payload-demo/vendor"),
+            &root2
+        ));
+        assert!(!is_app_install_path_at(Path::new("/work"), &root2));
+        assert_eq!(
+            app_install_root(Path::new("/tools/pi-flash-v0.1.12/pi-flash")),
+            Path::new("/tools/pi-flash-v0.1.12")
         );
     }
 }

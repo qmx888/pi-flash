@@ -499,8 +499,19 @@ fn fetch_release_body(version: &str) -> Result<String, String> {
 // 下载 → 校验 → 落位
 // ---------------------------------------------------------------------------
 
+/// 平台资产名。Windows 发布 `-win32-x64.zip`；macOS 发布
+/// `-darwin-arm64.zip`（release-macos.yml）。若所在平台没有对应
+/// 资产（如 mac 上查不到 darwin 包），更新检查应当按「无可用更新」处理。
 fn asset_name(version: &str) -> String {
-    format!("pi-flash-{}-win32-x64.zip", version_key_string(version))
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let plat = "darwin-arm64";
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    let plat = "darwin-x64";
+    #[cfg(windows)]
+    let plat = "win32-x64";
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let plat = "linux-x64";
+    format!("pi-flash-{}-{plat}.zip", version_key_string(version))
 }
 
 /// sha256sum 一行解析（`<hash>  file` / `<hash> *file`，与 lib.js 同规则）。
@@ -1226,7 +1237,12 @@ mod tests {
     /// 造一个「完整载荷目录」：exe（假文件）+ 版本戳。
     fn fake_payload(dir: &Path, ver: &str) {
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join(exe_rel()), b"fake-exe").unwrap();
+        // exe_rel() 在 mac 上带 .app/Contents/MacOS 三级，父目录得先建
+        let exe = dir.join(exe_rel());
+        if let Some(parent) = exe.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(exe, b"fake-exe").unwrap();
         std::fs::write(dir.join(".payload-version"), format!("{ver}\n")).unwrap();
     }
 
@@ -1279,7 +1295,10 @@ mod tests {
         // 半截：目录名对、戳缺失
         let broken = root.join("payload-0.1.11");
         std::fs::create_dir_all(&broken).unwrap();
-        std::fs::write(broken.join(exe_rel()), b"fake-exe").unwrap();
+        // 同 fake_payload：exe_rel() 在 mac 上有 .app 三层，先建父目录
+        let broken_exe = broken.join(exe_rel());
+        std::fs::create_dir_all(broken_exe.parent().unwrap()).unwrap();
+        std::fs::write(broken_exe, b"fake-exe").unwrap();
         // 名字与戳不符
         fake_payload(&root.join("payload-0.1.12"), "0.1.10");
 
@@ -1346,7 +1365,9 @@ mod tests {
         fake_payload(&me, "0.1.10");
         let old = root.join("payload.old-20261014215500");
         std::fs::create_dir_all(&old).unwrap();
-        std::fs::write(old.join(exe_rel()), b"x").unwrap();
+        let old_exe = old.join(exe_rel());
+        std::fs::create_dir_all(old_exe.parent().unwrap()).unwrap();
+        std::fs::write(old_exe, b"x").unwrap();
         std::fs::write(root.join("update-swap.log"), b"log").unwrap();
         std::fs::write(root.join("update-staged.json"), b"{}").unwrap();
         let old_stage = root.join("payload.stage-0.1.8");

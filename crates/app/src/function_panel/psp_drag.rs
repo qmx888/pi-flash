@@ -304,7 +304,7 @@ impl gpui::Render for ProjDragGhost {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_drop, shift_delta};
+    use super::{apply_drop, group_key, shift_delta};
     use crate::ProjectGroup;
     use std::path::PathBuf;
 
@@ -325,9 +325,13 @@ mod tests {
     fn move_down_and_up() {
         // a 下移到 c 之前（target=2）→ [b,a,c]；c 上移到顶（target=0）→ [c,b,a]
         let mut p = vec![group("a"), group("b"), group("c")];
-        assert!(apply_drop(&mut p, r"d:\a", 2));
+        // 键必须经 group_key 生成：Windows 上它折大小写、POSIX 上原样，
+        // 写死 "d:\\a" 只在 Windows 对得上
+        let ka = group_key(&p[0]);
+        let kc = group_key(&p[2]);
+        assert!(apply_drop(&mut p, &ka, 2));
         assert_eq!(names(&p), ["b", "a", "c"]);
-        assert!(apply_drop(&mut p, r"d:\c", 0));
+        assert!(apply_drop(&mut p, &kc, 0));
         assert_eq!(names(&p), ["c", "b", "a"]);
     }
 
@@ -335,8 +339,9 @@ mod tests {
     fn self_and_neighbor_targets_are_no_ops() {
         // 拖回自己（上缘 cur / 下缘 cur+1）都不动
         let mut p = vec![group("a"), group("b"), group("c")];
-        assert!(!apply_drop(&mut p, r"d:\b", 1));
-        assert!(!apply_drop(&mut p, r"d:\b", 2));
+        let kb = group_key(&p[1]);
+        assert!(!apply_drop(&mut p, &kb, 1));
+        assert!(!apply_drop(&mut p, &kb, 2));
         assert_eq!(names(&p), ["a", "b", "c"]);
     }
 
@@ -344,9 +349,10 @@ mod tests {
     fn stale_and_unknown_targets_are_safe() {
         // 陈旧落点越界钳尾；载荷键不存在 = False
         let mut p = vec![group("a"), group("b")];
-        assert!(apply_drop(&mut p, r"d:\a", 99));
+        let ka = group_key(&p[0]);
+        assert!(apply_drop(&mut p, &ka, 99));
         assert_eq!(names(&p), ["b", "a"]);
-        assert!(!apply_drop(&mut p, r"d:\missing", 0));
+        assert!(!apply_drop(&mut p, "no-such-key", 0));
         assert_eq!(names(&p), ["b", "a"]);
     }
 

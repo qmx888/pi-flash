@@ -99,10 +99,31 @@ pub fn git_status_files(cwd: &Path) -> Vec<GitFile> {
     };
     // porcelain 输出仓库根相对路径；重定基到 cwd，与文件树 read_dir 生成
     // 的路径同形态，flatten 的 git_map 才能命中。
+    //
+    // 平台陷阱（macOS）：`git rev-parse --show-toplevel` 返回的是 git 解析
+    // 过的**物理路径**（`/private/var/...`），而调用方的 cwd 可能是符号
+    // 链接拼法（`/var/...`）。直接 `cwd.strip_prefix(repo_root)` 会失配，
+    // 于是每条路径都退化成 `repo_root.join()` —— 与文件树读到的路径不同源，
+    // 徽标全落空。先按物理路径比对，失配再按原样比；两条都对不上时用
+    // canonicalize 归一后的 cwd 兜底。
     let repo_root = run_git(cwd, &["rev-parse", "--show-toplevel"])
         .map(|s| PathBuf::from(s.trim()))
         .unwrap_or_else(|| cwd.to_path_buf());
-    let rel_cwd = cwd.strip_prefix(&repo_root).ok();
+    let rel_cwd: Option<PathBuf> = cwd
+        .strip_prefix(&repo_root)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            // cwd 侧可能是 symlink 拼法（mac 的 /tmp、/var）；反之 repo_root
+            // 也可能是。两边都 canonicalize 后再比一次。
+            let canon_cwd = dunce::canonicalize(cwd).ok()?;
+            let canon_root = dunce::canonicalize(&repo_root).ok()?;
+            canon_cwd
+                .strip_prefix(&canon_root)
+                .ok()
+                .map(Path::to_path_buf)
+        });
+    let rel_cwd = rel_cwd.as_deref();
     let mut files = Vec::new();
     // -z: 记录 NUL 分隔；rename/copy 是两条记录——新路径带 "XY " 前缀，
     // 旧路径是紧跟的无前缀记录（没有 TAB 可切）。

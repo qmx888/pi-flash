@@ -188,7 +188,18 @@ fn project_context_segments<'a>(
 ) -> Vec<(SystemBucket, &'a str)> {
     const OPEN: &str = "<project_instructions path=\"";
     const CLOSE: &str = "</project_instructions>";
-    let norm = |s: &str| s.replace('/', "\\").to_ascii_lowercase();
+    // 路径归一按平台分：Windows 上 `/` 与 `\` 等价、大小写不敏感；
+    // POSIX 上不同分隔符/大小写就是不同路径，折平会把无关段归错桶。
+    let norm = |s: &str| -> String {
+        #[cfg(windows)]
+        {
+            s.replace('/', "\\").to_ascii_lowercase()
+        }
+        #[cfg(not(windows))]
+        {
+            s.to_string()
+        }
+    };
     let global_prefix = agent_dir.map(|p: &std::path::Path| norm(p.to_string_lossy().as_ref()));
 
     let mut out: Vec<(SystemBucket, &str)> = Vec::new();
@@ -379,6 +390,7 @@ mod tests {
 
     /// breakdown：7 桶归属 + project_context 按路径切全局/项目。
     #[test]
+    #[cfg(windows)]
     fn breakdown_buckets_sections_and_tools() {
         use super::super::estimate::estimate_tokens;
         use SystemBucket::*;
@@ -465,6 +477,7 @@ mod tests {
     /// segments：分段顺序 = prompt 顺序；project_context 切块产生全局/项目
     /// 交替段；同 part 内相邻同桶合并、part 之间不合并。
     #[test]
+    #[cfg(windows)]
     fn segments_follow_prompt_order() {
         use SystemBucket::*;
         let entries = vec![json!({
@@ -496,6 +509,7 @@ mod tests {
     /// project_context_segments：原始切分（未合并）；标签外文字归项目、
     /// 路径归一化（/ 与 \ 等价、大小写不敏感）。
     #[test]
+    #[cfg(windows)]
     fn split_project_context_by_path() {
         let text = "head <project_instructions path=\"C:/Users/u/.pi/agent/AGENTS.md\">G</project_instructions> mid <project_instructions path=\"D:\\repo\\AGENTS.md\">P</project_instructions> tail";
         let segs =
@@ -507,6 +521,34 @@ mod tests {
                 (SystemBucket::GlobalPrompt, "G"),
                 (SystemBucket::ProjectPrompt, " mid "),
                 (SystemBucket::ProjectPrompt, "P"),
+                (SystemBucket::ProjectPrompt, " tail"),
+            ]
+        );
+    }
+
+    /// POSIX 版：路径按字面比较（区分大小写、`/` 与 `\` 不同一）。
+    #[test]
+    #[cfg(not(windows))]
+    fn split_project_context_by_path() {
+        let text = "head <project_instructions path=\"/Users/u/.pi/agent/AGENTS.md\">G</project_instructions> mid <project_instructions path=\"/repo/AGENTS.md\">P</project_instructions> tail";
+        let segs = project_context_segments(text, Some(std::path::Path::new("/Users/u/.pi/agent")));
+        assert_eq!(
+            segs,
+            vec![
+                (SystemBucket::ProjectPrompt, "head "),
+                (SystemBucket::GlobalPrompt, "G"),
+                (SystemBucket::ProjectPrompt, " mid "),
+                (SystemBucket::ProjectPrompt, "P"),
+                (SystemBucket::ProjectPrompt, " tail"),
+            ]
+        );
+        // 大小写不同 = 不是全局（POSIX 上 /Users/U 是另一个目录）
+        let other = "head <project_instructions path=\"/Users/U/.pi/agent/AGENTS.md\">G</project_instructions> tail";
+        assert_eq!(
+            project_context_segments(other, Some(std::path::Path::new("/Users/u/.pi/agent"))),
+            vec![
+                (SystemBucket::ProjectPrompt, "head "),
+                (SystemBucket::ProjectPrompt, "G"),
                 (SystemBucket::ProjectPrompt, " tail"),
             ]
         );

@@ -85,16 +85,31 @@ fn save_map_to(path: &Path, map: &serde_json::Map<String, Value>) -> bool {
     pi_link::config::write_json(path, &value).is_ok()
 }
 
-/// Normalized workspace key: Path components joined with "\\", so
-/// "D:/a/b" and "D:\a\b" share one memory slot (Windows path parity).
+/// Normalized workspace key: platform-specific path identity.
+///
+/// - Windows: components joined with "\\", trailing separator stripped,
+///   case-folded ("D:/a/b" and "D:\a\b" share one slot).
+/// - macOS/Linux: trailing separator stripped only — `/` and case are kept,
+///   because APFS is case-sensitive by default and folding `~/Proj` onto
+///   `~/proj` would merge two real directories into one memory slot.
 fn ws_key(cwd: &str) -> String {
-    // String-level normalization: "/" -> "\\", strip trailing separator,
-    // case-fold (Windows paths are case-insensitive).
-    let mut k = cwd.replace('/', "\\");
-    while k.ends_with('\\') {
-        k.pop();
+    #[cfg(windows)]
+    {
+        let mut k = cwd.replace('/', "\\");
+        while k.ends_with('\\') {
+            k.pop();
+        }
+        k.to_ascii_lowercase()
     }
-    k.to_ascii_lowercase()
+    #[cfg(not(windows))]
+    {
+        let mut k = cwd.to_string();
+        // 根目录 "/" 去掉尾分隔符会变空串，退化成「所有路径都匹配」——保留。
+        while k.len() > 1 && k.ends_with('/') {
+            k.pop();
+        }
+        k
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +179,12 @@ pub fn project_name(path: &Path) -> String {
 pub fn is_under(path: &Path, root: &Path) -> bool {
     let p = ws_key(&path.to_string_lossy());
     let r = ws_key(&root.to_string_lossy());
-    p == r || p.starts_with(&format!("{r}\\"))
+    // 分隔符跟 ws_key 的平台口径一致：Windows 折成 `\\`，POSIX 保持 `/`。
+    #[cfg(windows)]
+    let sep = "\\";
+    #[cfg(not(windows))]
+    let sep = "/";
+    p == r || p.starts_with(&format!("{r}{sep}"))
 }
 
 /// 磁盘改动指纹 (mtime, len)（023 外部改动检测基准）：打开/保存/确认时
@@ -1163,6 +1183,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn purge_app_memory_drops_poisoned_keys_only() {
         let root = Path::new("D:/softwares/pi-flash");
         let mut map = serde_json::Map::new();
@@ -1183,6 +1204,34 @@ mod tests {
         assert!(!map.contains_key(WS_LAST_KEY), "脏 __last 删键");
         assert!(!map.contains_key("d:\\softwares\\pi-flash\\payload"));
         assert_eq!(map.get("d:\\ai_workspace\\pi_work").unwrap(), "keep.jsonl");
+        assert!(map.contains_key("__window"), "非路径键不动");
+        assert_eq!(purge_app_paths_in_map(&mut map, None), 0);
+        assert_eq!(purge_app_paths_in_map(&mut map, Some(root)), 0, "幂等");
+    }
+
+    /// POSIX 版：键是 `/` 分隔、大小写敏感。
+    #[test]
+    #[cfg(not(windows))]
+    fn purge_app_memory_drops_poisoned_keys_only() {
+        let root = Path::new("/opt/pi-flash");
+        let mut map = serde_json::Map::new();
+        map.insert(
+            WS_LAST_KEY.into(),
+            Value::String("/opt/pi-flash/payload".into()),
+        );
+        map.insert(
+            "/opt/pi-flash/payload".into(),
+            Value::String("sess.jsonl".into()),
+        );
+        map.insert(
+            "/home/u/workspace/pi_work".into(),
+            Value::String("keep.jsonl".into()),
+        );
+        map.insert("__window".into(), serde_json::json!({"max": true}));
+        assert_eq!(purge_app_paths_in_map(&mut map, Some(root)), 2);
+        assert!(!map.contains_key(WS_LAST_KEY), "脏 __last 删键");
+        assert!(!map.contains_key("/opt/pi-flash/payload"));
+        assert_eq!(map.get("/home/u/workspace/pi_work").unwrap(), "keep.jsonl");
         assert!(map.contains_key("__window"), "非路径键不动");
         assert_eq!(purge_app_paths_in_map(&mut map, None), 0);
         assert_eq!(purge_app_paths_in_map(&mut map, Some(root)), 0, "幂等");
@@ -1323,6 +1372,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn is_under_normalizes_separators_and_case() {
         // cwd 内（正/反斜杠、大小写都要判对）
         assert!(is_under(Path::new("D:\\proj\\src"), Path::new("D:\\proj")));
@@ -1335,6 +1385,22 @@ mod tests {
             Path::new("D:\\my_obsidian\\vault"),
             Path::new("D:\\ai_workspace")
         ));
+    }
+
+    /// POSIX 版：分隔符是 `/`，大小写有意义。
+    #[test]
+    #[cfg(not(windows))]
+    fn is_under_normalizes_separators_and_case() {
+        assert!(is_under(Path::new("/proj/src"), Path::new("/proj")));
+        assert!(is_under(Path::new("/proj"), Path::new("/proj/")));
+        // 前缀像但不是子目录
+        assert!(!is_under(Path::new("/proj2"), Path::new("/proj")));
+        // 大小写不同 = 不同目录（APFS 默认大小写敏感）
+        assert!(!is_under(Path::new("/PROJ/src"), Path::new("/proj")));
+        // 反斜杠在 POSIX 是普通文件名字符，不是分隔符
+        assert!(!is_under(Path::new("/proj\\src"), Path::new("/proj")));
+        // 工作区外
+        assert!(!is_under(Path::new("/vault"), Path::new("/workspace")));
     }
 
     #[test]

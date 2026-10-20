@@ -92,6 +92,10 @@ fn drag_icon(drag: &TabDrag, size: f32, color: u32) -> Option<gpui::AnyElement> 
 pub(crate) const HEIGHT: f32 = 40.;
 
 /// Caption-button glyph font (Win11; MDL2 covers Win10).
+///
+/// 只有 Windows 有这套图标字体；macOS/Linux 走 assets/icons 的 SVG
+/// (`caption_button` 里按 `cfg` 分支)，所以该常量在非 Windows 上是未使用项。
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const CAPTION_FONT: &str = "Segoe Fluent Icons";
 
 /// 左段（015 功能面板侧）：收放钮贴左 = `tokens::align::TOGGLE_ML`（图标
@@ -188,17 +192,40 @@ pub(crate) fn topbar_r(
     );
 
     // 016 右段：仅窗口控制钮（设置下放 018 状态栏、+ 删除）
-    // v55: min/max switch to SVG icons via HoverIcon; close keeps red-bg exemption
-    for (area, icon_name) in [
-        (WindowControlArea::Min, "minus"),
-        (
-            WindowControlArea::Max,
-            if maximized { "restore" } else { "square" },
-        ),
-    ] {
-        bar = bar.child(caption_button(area, icon_name, t));
+    //
+    // 平台差异：`WindowControlArea` 命中盒只有 Windows 端被平台消费
+    // （`platform/windows/events.rs` 的 WM_NCHITTEST 回调；macOS 侧
+    // `on_hit_test_window_control` 是空实现）。mac 上原生红绿灯仍然存在
+    // （style mask 含 closable/miniaturizable/zoomable），所以自绘三钮既
+    // 点不动又和红绿灯重复——mac 只留右侧留白，拖动靠标题栏空白区。
+    #[cfg(windows)]
+    {
+        // v55: min/max switch to SVG icons via HoverIcon; close keeps red-bg exemption
+        let _ = maximized;
+        for (area, icon_name) in [
+            (WindowControlArea::Min, "minus"),
+            (
+                WindowControlArea::Max,
+                if maximized { "restore" } else { "square" },
+            ),
+        ] {
+            bar = bar.child(caption_button(area, icon_name, t));
+        }
+        bar.child(caption_button(WindowControlArea::Close, "\u{E8BB}", t))
     }
-    bar.child(caption_button(WindowControlArea::Close, "\u{E8BB}", t))
+    #[cfg(not(windows))]
+    {
+        // 红绿灯占位的右侧留白（原生按钮画在客户区左上角，右段只补拖拽区）
+        let _ = maximized;
+        bar.child(
+            div()
+                .w(px(12.))
+                .h_full()
+                .flex_shrink_0()
+                .window_control_area(WindowControlArea::Drag),
+        )
+        .into_any_element()
+    }
 }
 
 /// 30×30 图标钮（topbar 通用；hover chrome-hover）。钮盒/图标走 align 令牌。
@@ -644,6 +671,9 @@ fn tab_shell(
         .on_click(switch)
 }
 
+/// 窗口控制钮（自绘）。只有 Windows 调用（`topbar_r` 的 cfg 分支）；
+/// macOS/Linux 用原生窗口按钮，这个函数在该平台是死代码。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn caption_button(
     area: WindowControlArea,
     icon_name: &'static str,

@@ -780,6 +780,7 @@ mod tests {
 
     /// 在 cwd 下的相对分段：每段路径累积正确，最后一段 = 全路径。
     #[test]
+    #[cfg(windows)]
     fn crumbs_relative_under_cwd() {
         let cwd = PathBuf::from("C:\\proj");
         let segs = breadcrumb_segments(&cwd, Path::new("C:\\proj\\src\\a.rs"));
@@ -787,6 +788,18 @@ mod tests {
         assert_eq!(texts, vec!["src", "a.rs"]);
         assert_eq!(segs[0].1, PathBuf::from("C:\\proj\\src"));
         assert_eq!(segs[1].1, PathBuf::from("C:\\proj\\src\\a.rs"));
+    }
+
+    /// POSIX 版：同一断言，路径用 `/` 拼。
+    #[test]
+    #[cfg(not(windows))]
+    fn crumbs_relative_under_cwd() {
+        let cwd = PathBuf::from("/proj");
+        let segs = breadcrumb_segments(&cwd, Path::new("/proj/src/a.rs"));
+        let texts: Vec<String> = segs.iter().map(|(t, _)| t.to_string()).collect();
+        assert_eq!(texts, vec!["src", "a.rs"]);
+        assert_eq!(segs[0].1, PathBuf::from("/proj/src"));
+        assert_eq!(segs[1].1, PathBuf::from("/proj/src/a.rs"));
     }
 
     /// 工作区外绝对路径：Windows 盘符 + 根合成 "D:\\" 一段（此前拆成
@@ -827,7 +840,11 @@ mod tests {
             unsupported_type_name(Path::new("fonts/JetBrainsMono-Bold.ttf")),
             "ttf"
         );
+        // POSIX 上 `\\` 是普通文件名字符，不是分隔符——文件名才是 `bin\\app`
+        #[cfg(windows)]
         assert_eq!(unsupported_type_name(Path::new("bin\\app")), "app");
+        #[cfg(not(windows))]
+        assert_eq!(unsupported_type_name(Path::new("bin/app")), "app");
         assert_eq!(unsupported_type_name(Path::new("Makefile")), "Makefile");
     }
 }

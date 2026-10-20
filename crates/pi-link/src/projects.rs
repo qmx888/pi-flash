@@ -30,14 +30,31 @@ pub struct ProjectRecord {
     pub last_opened_ms: i64,
 }
 
-/// 归一化项目键：与 app 侧 `services::workspace::ws_key` 同口径
-/// （`/`→`\`、去尾分隔符、大小写折叠——Windows 路径字符串级等值）。
+/// 归一化项目键：与 app 侧 `services::workspace::ws_key` 同口径。
+///
+/// 口径按平台分：
+/// - Windows：`/`→`\`、去尾分隔符、**大小写折叠**（NTFS 大小写不敏感）；
+/// - macOS/Linux：只去尾分隔符，**保留大小写**、保留 `/`（APFS 默认
+///   大小写敏感，`~/Proj` 与 `~/proj` 是两个目录；把 `/` 折成 `\` 还会
+///   让 mac 上所有路径看起来像同一个 Windows 路径）。
 pub fn path_key(path: &Path) -> String {
-    let mut k = path.to_string_lossy().replace('/', "\\");
-    while k.ends_with('\\') {
-        k.pop();
+    #[cfg(windows)]
+    {
+        let mut k = path.to_string_lossy().replace('/', "\\");
+        while k.ends_with('\\') {
+            k.pop();
+        }
+        k.to_ascii_lowercase()
     }
-    k.to_ascii_lowercase()
+    #[cfg(not(windows))]
+    {
+        let mut k = path.to_string_lossy().into_owned();
+        // 根目录 "/" 去掉尾分隔符会变空串，退化成「所有路径都匹配」——保留。
+        while k.len() > 1 && k.ends_with('/') {
+            k.pop();
+        }
+        k
+    }
 }
 
 fn now_ms() -> i64 {
@@ -190,6 +207,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn register_upserts_and_touches() {
         let mut r = Registry::load(&temp_file("upsert"));
         r.register_at(Path::new("D:\\a\\demo"), 1_000);
@@ -202,6 +220,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
+    fn register_upserts_and_touches() {
+        let mut r = Registry::load(&temp_file("upsert"));
+        r.register_at(Path::new("/a/demo"), 1_000);
+        r.register_at(Path::new("/b/older"), 500);
+        assert_eq!(r.records()[0].path, PathBuf::from("/a/demo"));
+        // re-register bumps to the top（尾分隔符仍折叠）
+        r.register_at(Path::new("/a/demo/"), 2_000);
+        assert_eq!(r.records()[0].path, PathBuf::from("/a/demo/"));
+        assert_eq!(r.records().len(), 2, "trailing separator still merges");
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn path_key_normalizes_like_ws_key() {
         assert_eq!(
             path_key(Path::new("d:/a\\B/")),
@@ -211,6 +243,33 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
+    fn path_key_normalizes_like_ws_key() {
+        // 尾分隔符折叠，不折叠大小写
+        assert_eq!(
+            path_key(Path::new("/a/b/")),
+            path_key(Path::new("/a/b"))
+        );
+        assert_eq!(path_key(Path::new("/x")), "/x");
+        // POSIX 大小写敏感：两个目录必须不同键
+        assert_ne!(path_key(Path::new("/Proj")), path_key(Path::new("/proj")));
+        // 根目录不能折成空串
+        assert_eq!(path_key(Path::new("/")), "/");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn remove_drops_entry() {
+        let mut r = Registry::load(&temp_file("rm"));
+        r.register_at(Path::new("/a"), 10);
+        r.register_at(Path::new("/b"), 20);
+        r.remove(Path::new("/a/"));
+        assert_eq!(r.records().len(), 1);
+        assert_eq!(r.records()[0].path, PathBuf::from("/b"));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn remove_drops_entry() {
         let mut r = Registry::load(&temp_file("rm"));
         r.register_at(Path::new("D:\\a"), 10);
@@ -234,6 +293,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn purge_app_paths_drops_install_dir_entries() {
         let mut r = Registry::load(&temp_file("purge"));
         r.register_at(Path::new("D:\\softwares\\pi-flash\\payload"), 3_000);
@@ -250,6 +310,22 @@ mod tests {
             r.purge_app_paths_at(Some(Path::new("D:/SOFTWARES/pi-flash"))),
             0
         );
+    }
+
+    /// POSIX 版：安装根判定按 `/` 分隔、大小写敏感。
+    #[test]
+    #[cfg(not(windows))]
+    fn purge_app_paths_drops_install_dir_entries() {
+        let mut r = Registry::load(&temp_file("purge"));
+        r.register_at(Path::new("/opt/pi-flash/payload"), 3_000);
+        r.register_at(Path::new("/work"), 2_000);
+        assert_eq!(r.purge_app_paths_at(None), 0);
+        assert_eq!(r.records().len(), 2);
+        let removed = r.purge_app_paths_at(Some(Path::new("/opt/pi-flash")));
+        assert_eq!(removed, 1, "载荷目录条目清除，用户项目保留");
+        assert_eq!(r.records().len(), 1);
+        assert_eq!(r.records()[0].path, PathBuf::from("/work"));
+        assert_eq!(r.purge_app_paths_at(Some(Path::new("/opt/pi-flash"))), 0);
     }
 
     #[test]

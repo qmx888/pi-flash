@@ -159,6 +159,27 @@ pub struct SelPt {
     pub col: usize,
 }
 
+/// 默认 shell 三元：Windows 用 ComSpec，macOS/Linux 用 `$SHELL` 再退
+/// `/bin/zsh`（macOS 10.15+ 的默认登录 shell）。
+///
+/// Windows 分支原本写死 `cmd.exe`，在 mac 上 spawn 会直接 ENOENT——终端
+/// 面板于是永远开不出来（`open_terminal` 把 spawn 失败扔进 status bar）。
+fn default_shell() -> Shell {
+    #[cfg(windows)]
+    {
+        let program = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        Shell::new(program, Vec::new())
+    }
+    #[cfg(not(windows))]
+    {
+        let program = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "/bin/zsh".to_string());
+        Shell::new(program, Vec::new())
+    }
+}
+
 /// Spawn the PTY + alacritty event loop for one tab.
 /// `cell_w`/`line_h` come from measuring the mono font in the opening window;
 /// `font_size` 是它们所按的字号戳（restart 沿用旧 tab 时一并继承）。
@@ -183,9 +204,7 @@ pub fn spawn_terminal(
     let term = Arc::new(FairMutex::new(Term::new(config, &dims, proxy.clone())));
 
     let mut options = tty::Options::default();
-    // terminal-manager.ts: win32 -> ComSpec ?? cmd.exe with no args
-    let shell = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
-    options.shell = Some(Shell::new(shell, Vec::new()));
+    options.shell = Some(default_shell());
     options.working_directory = Some(cwd.clone());
     options.env = shell_env();
     options.drain_on_exit = true;
@@ -1195,11 +1214,14 @@ mod tests {
         );
     }
 
-    /// Real ConPTY smoke test (no gpui): spawn cmd.exe through the same
-    /// tty::new + EventLoop bridge the terminal tabs use, echo a marker, and
-    /// read it back off the grid.
+    /// Real PTY smoke test (no gpui): spawn the platform default shell
+    /// through the same tty::new + EventLoop bridge the terminal tabs use,
+    /// echo a marker, and read it back off the grid.
+    ///
+    /// Windows = ConPTY + cmd.exe; macOS/Linux = openpty + login sh. 两端
+    /// 都跑同一个断言，mac 上线缆故障（shell 路径写死 cmd.exe 那种）会
+    /// 直接在这里红，不用等到手点终端面板。
     #[test]
-    #[cfg(windows)]
     fn conpty_echo_smoke() {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
@@ -1221,7 +1243,7 @@ mod tests {
             Chan(tx.clone()),
         )));
         let mut options = tty::Options::default();
-        options.shell = Some(Shell::new("cmd.exe".into(), Vec::new()));
+        options.shell = Some(Shell::new(smoke_shell().to_string(), Vec::new()));
         options.drain_on_exit = false;
         let pty = tty::new(
             &options,
@@ -1239,8 +1261,13 @@ mod tests {
         let notifier = event_loop.channel();
         event_loop.spawn();
 
+        // sh/cmd 都认 `echo`；行尾按平台给（POSIX 用 LF，cmd 用 CRLF）
+        #[cfg(windows)]
+        let probe: &[u8] = b"echo PIFLASH_OK\r\n";
+        #[cfg(not(windows))]
+        let probe: &[u8] = b"echo PIFLASH_OK\n";
         notifier
-            .send(Msg::Input(b"echo PIFLASH_OK\r\n".to_vec().into()))
+            .send(Msg::Input(probe.to_vec().into()))
             .expect("write to pty");
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut saw_output = false;
@@ -1265,7 +1292,20 @@ mod tests {
             }
         }
         let _ = notifier.send(Msg::Shutdown);
-        assert!(saw_output, "conpty round-trip never produced echo output");
+        assert!(saw_output, "pty round-trip never produced echo output");
+    }
+
+    /// 冒烟用的 shell：与 `default_shell()` 同口径，但**必须是 POSIX sh
+    /// 兼容**的（mac 上用户 SHELL 可能是 fish/nu，`echo` 语义虽在但启动
+    /// 更慢；冒烟只要线缆通，固定 /bin/sh 最稳）。
+    #[cfg(not(windows))]
+    fn smoke_shell() -> &'static str {
+        "/bin/sh"
+    }
+
+    #[cfg(windows)]
+    fn smoke_shell() -> &'static str {
+        "cmd.exe"
     }
 }
 

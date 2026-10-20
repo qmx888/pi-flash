@@ -120,7 +120,30 @@ pub fn play_notify_sound() {
     }
     #[cfg(not(windows))]
     {
-        // 其他平台暂无内置播放器，保持 no-op（与旧 MessageBeep 实现一致）。
+        use std::sync::OnceLock;
+        // macOS/Linux 没有 winmm；走单声道 WAV 落到临时文件 + 系统播放器
+        // （macOS `afplay`，其余 `aplay`）。临时文件只合成一次并常驻，播放
+        // 进程 detached — 提示音绝不能阻塞 UI 线程。
+        static WAV_PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+        let path = WAV_PATH.get_or_init(|| {
+            let dir = std::env::temp_dir();
+            let p = dir.join(format!("pi-flash-chime-{}.wav", std::process::id()));
+            std::fs::write(&p, done_chime_wav()).ok()?;
+            Some(p)
+        });
+        let Some(path) = path.as_ref() else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        let player = "afplay";
+        #[cfg(not(target_os = "macos"))]
+        let player = "aplay";
+        let _ = std::process::Command::new(player)
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn();
     }
 }
 

@@ -249,8 +249,16 @@ fn app_settings() -> AppSettings {
 }
 
 pub fn default_font_family() -> String {
-    // system UI font; gpui resolves it per-platform
-    "Segoe UI".to_string()
+    // system UI font; gpui resolves it per-platform. `Segoe UI` 只在 Windows
+    // 存在——macOS 没这个 family 时 gpui 会回落 .AppleSystemUIFont，但字体
+    // 面板里会留一行选不中的「Segoe UI」，这里按平台给真实 family。
+    #[cfg(windows)]
+    let name = "Segoe UI";
+    #[cfg(target_os = "macos")]
+    let name = ".AppleSystemUIFont";
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let name = "Sans";
+    name.to_string()
 }
 
 // ---------------------------------------------------------------------------
