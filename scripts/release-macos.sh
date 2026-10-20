@@ -50,6 +50,16 @@ fi
   echo "✗ vendor/pi 未安装（cd vendor/pi && npm ci）"; exit 1;
 }
 
+# 临时目录统一清理（NODE_TMP 在 2/7 建、STAGE 在 5/7 建）
+NODE_TMP=""
+STAGE=""
+cleanup_tmp() {
+  [[ -n "$NODE_TMP" ]] && rm -rf "$NODE_TMP"
+  [[ -n "$STAGE" ]] && rm -rf "$STAGE"
+  return 0
+}
+trap cleanup_tmp EXIT
+
 echo "==> 1/7 release 构建（$TAG）"
 # macOS 不用 Metal shader 编译链（CommandLineTools 没有 `metal` 工具，gpui 的
 # build.rs 会 xcrun 失败）。gpui 的 macos-blade 特性改走 WGSL/blade 渲染后端，
@@ -64,14 +74,46 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # 主可执行文件只能有这一个：Contents/MacOS 里多放东西会让外层 codesign 报
 # "code object is not signed at all"（同 CI）。node / vendor / 图标全进
 # Contents/Resources，pi_link::vendor 的搜索路径已含它。
+#
+# strip 掉调试符号（71M → 62M）；不 strip 的话包里还有完整 DWARF，用户拿不到
+# 任何好处，只是白占体积。
 cp target/release/pi-flash "$APP/Contents/MacOS/pi-flash"
+strip -S "$APP/Contents/MacOS/pi-flash" 2>/dev/null || true
 
-NODE_BIN=${PI_FLASH_NODE:-$(command -v node || true)}
-[[ -n "$NODE_BIN" ]] || { echo "✗ 找不到 node（PATH 或 PI_FLASH_NODE）"; exit 1; }
+# 包内自检：非 release 的二进制会带路径里的 `target/debug` 字样或 `debug_assertions`
+# 分支，最可靠的判据是体积异常 + 符号表仍在。真正的把关是下面的 strip 后大小断言。
+BIN_BYTES=$(wc -c < "$APP/Contents/MacOS/pi-flash")
+(( BIN_BYTES > 120 * 1024 * 1024 )) && {
+  echo "✗ 主可执行文件 ${BIN_BYTES} 字节偏大——很可能是 target/debug 产物被混进来";
+  echo "  重新跑 cargo build --release -p app 后再打包"; exit 1;
+}
+
+# node 运行时：优先取官方 darwin-arm64 包（与 CI 同源，体积/ABI 可控），
+# 退化到 PATH 上的 node。两者都 strip——官方二进制 104M，strip 后 82M；
+# 本机 fnm 托管的 node 带更全的符号，strip 后仍有 ~100M。
+NODE_TMP=$(mktemp -d)
+NODE_BIN=""
+NODE_VERSION=${PF_NODE_VERSION:-v22.14.0}
+NODE_TARBALL="node-${NODE_VERSION}-darwin-arm64.tar.gz"
+if curl -fsSL --max-time 180 -o "$NODE_TMP/$NODE_TARBALL" \
+     "https://nodejs.org/dist/${NODE_VERSION}/${NODE_TARBALL}" 2>/dev/null; then
+  tar -xzf "$NODE_TMP/$NODE_TARBALL" -C "$NODE_TMP" "node-${NODE_VERSION}-darwin-arm64/bin/node" 2>/dev/null && \
+    NODE_BIN="$NODE_TMP/node-${NODE_VERSION}-darwin-arm64/bin/node"
+fi
+if [[ -z "$NODE_BIN" ]]; then
+  echo "    ⚠ 未能下载官方 node（${NODE_VERSION}），回退到 PATH / PI_FLASH_NODE"
+  NODE_BIN=${PI_FLASH_NODE:-$(command -v node || true)}
+fi
+[[ -n "$NODE_BIN" && -f "$NODE_BIN" ]] || { echo "✗ 找不到可用的 node"; exit 1; }
 cp "$NODE_BIN" "$APP/Contents/Resources/node"
+strip -S "$APP/Contents/Resources/node" 2>/dev/null || true
 chmod +x "$APP/Contents/Resources/node"
 
-cp -R vendor "$APP/Contents/Resources/vendor"
+# 只带运行时需要的 vendor/pi。vendor/ 下还有 gpui、gpui-component——那是
+# **编译期**依赖（Cargo [patch.crates-io] 指向它们），Rust 源码进包纯属浪费
+# （≈10MB）；ci 的 release-macos.yml 整目录复制是老写法，这里按目录白名单收。
+mkdir -p "$APP/Contents/Resources/vendor"
+cp -R vendor/pi "$APP/Contents/Resources/vendor/pi"
 [[ -f crates/app/assets/macos/pi-flash.icns ]] && \
   cp crates/app/assets/macos/pi-flash.icns "$APP/Contents/Resources/pi-flash.icns"
 
@@ -80,6 +122,19 @@ if [[ -d extensions/pi-subagents ]]; then
   mkdir -p "$APP/Contents/Resources/extensions"
   cp -R extensions/pi-subagents "$APP/Contents/Resources/extensions/"
 fi
+
+# 裁 node_modules 里的纯体积垃圾（运行时一律不读）：
+#   *.map        sourcemap，≈39MB / 2500 个文件，只有调试 pi 本身才用
+#   *.d.ts       TypeScript 类型声明，≈25MB / 3500 个文件，Node 不加载
+#   *.d.ts.map / 文档目录   同上
+# pi 是 vendored 固定版本，用户不会在此树里调试；真要排查可以对照 npm 上的包。
+# `--` 与 -print0 避免路径里的空格/中文被拆。
+find "$APP/Contents/Resources/vendor" \
+  \( -name '*.map' -o -name '*.d.ts' -o -name '*.d.mts' -o -name '*.d.cts' \) \
+  -print0 2>/dev/null | xargs -0 rm -f 2>/dev/null || true
+find "$APP/Contents/Resources/vendor" -type d \
+  \( -name 'test' -o -name 'tests' -o -name '__tests__' -o -name 'docs' -o -name 'example' -o -name 'examples' \) \
+  -prune -print0 2>/dev/null | xargs -0 rm -rf 2>/dev/null || true
 
 # 裁非宿主 esbuild 二进制（与 release.sh 同规则；pi 1.2.0+ 已无 esbuild 则跳过）
 for ESD in \
@@ -163,7 +218,6 @@ echo "    启动正常"
 
 echo "==> 5/7 生成 $DMG（拖拽安装布局）"
 STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 # UDZO = zlib 压缩，兼容 macOS 13+；HFS+ 卷名不带版本，Finder 里显示为 pi-flash
